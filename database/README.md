@@ -77,22 +77,26 @@ that work later.
 
 ```sh
 helm install dbaas oci://ghcr.io/tgcjananga/charts/dbaas-operator \
-  --version v0.1.0 \
+  --version 0.1.0 \
   --namespace dbaas-system \
-  --create-namespace \
+  --create-namespace
+```
+
+On **Kube-OVN** clusters, pass the logical switch so the controller can reach
+VM probes across tenant VPCs. On standard pod-network clusters this flag is
+safe to omit — the annotation is silently ignored:
+
+```sh
   --set manager.args="{--leader-elect,--mgmt-logical-switch=ovn-default}"
 ```
 
-Upgrade to a new version:
+Helm lifecycle commands:
 
 ```sh
-helm upgrade dbaas oci://ghcr.io/tgcjananga/charts/dbaas-operator --version <new-version>
-```
-
-Uninstall:
-
-```sh
-helm uninstall dbaas -n dbaas-system
+helm upgrade dbaas oci://ghcr.io/tgcjananga/charts/dbaas-operator --version <new-version>  # upgrade
+helm rollback dbaas 1 -n dbaas-system         # roll back to previous revision
+helm history dbaas -n dbaas-system            # view release history
+helm uninstall dbaas -n dbaas-system          # remove everything
 ```
 
 ### Option B — Kustomize / make (for contributors and Terraform path)
@@ -145,15 +149,20 @@ make manifests          # regenerate CRD YAML from Go types
 make generate           # regenerate zz_generated.deepcopy.go
 
 # Always run these after any config/ or types change:
-make build-installer                        # regenerate dist/install.yaml
-kubebuilder edit --plugins=helm/v2-alpha    # regenerate dist/chart/
+make build-installer IMG=<registry>/<name>:<tag>  # regenerate dist/install.yaml
+kubebuilder edit --plugins=helm/v2-alpha           # regenerate dist/chart/
 
 # Verify the chart still renders correctly:
 helm lint dist/chart
 helm install dbaas dist/chart --dry-run=client --namespace dbaas-system
 
-# Then commit all three together:
+# Commit source + generated output together:
 git add api/ config/ dist/
+git commit -m "feat: <describe your change>"
+
+# For a release — package and push the chart to GHCR:
+helm package dist/chart --version <tag>
+helm push dbaas-operator-<tag>.tgz oci://ghcr.io/tgcjananga/charts
 ```
 
 ## Part of Open Cloud Datacenter

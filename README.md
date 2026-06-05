@@ -67,7 +67,7 @@ Three paths — all produce identical running state in the cluster:
 
 | Path | Who uses it | How |
 |---|---|---|
-| **Helm** | Public users, open-source adopters | `helm install dbaas oci://ghcr.io/tgcjananga/charts/dbaas-operator` |
+| **Helm** | Public users, open-source adopters | `helm install dbaas oci://ghcr.io/wso2/charts/dbaas-operator` |
 | **Kustomize / make** | Contributors, internal team | `make deploy IMG=<registry>/<name>:<tag>` |
 | **Terraform** | WSO2 automated platform deployment | `terraform` branch `modules/operators/<name>/` renders `config/default/` kustomize tree |
 

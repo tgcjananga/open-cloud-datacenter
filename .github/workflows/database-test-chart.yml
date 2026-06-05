@@ -2,7 +2,17 @@ name: Test Chart
 
 on:
   push:
+    branches:
+      - operators
+      - helm-chart
+    paths:
+      - database/**
   pull_request:
+    branches:
+      - operators
+      - helm-chart
+    paths:
+      - database/**
 
 permissions: {}
 

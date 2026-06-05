@@ -1,0 +1,32 @@
+apiVersion: v2
+name: dbaas-operator
+description: >
+  Kubernetes operator that provisions managed PostgreSQL databases as KubeVirt
+  VMs on a Harvester HCI cluster. One DBInstance custom resource maps to one VM
+  with persistent storage, SSL-only PostgreSQL, admin credentials, and optional
+  Prometheus monitoring.
+type: application
+
+version: 0.1.0
+appVersion: "v0.1.0"
+
+keywords:
+  - kubernetes
+  - operator
+  - postgresql
+  - dbaas
+  - harvester
+  - kubevirt
+  - wso2
+
+home: https://github.com/wso2/open-cloud-datacenter/tree/operators/database
+
+sources:
+  - https://github.com/wso2/open-cloud-datacenter
+
+maintainers:
+  - name: WSO2 Open Cloud Datacenter
+    url: https://github.com/wso2/open-cloud-datacenter
+
+annotations:
+  kubebuilder.io/generated-by: kubebuilder

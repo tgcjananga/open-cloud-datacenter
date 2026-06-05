@@ -41,6 +41,9 @@ Inside an operator directory:
 ├── api/            CRD Go types + zz_generated DeepCopy
 ├── cmd/            main.go (controller-runtime entrypoint)
 ├── config/         kustomize tree (CRDs, RBAC, manager Deployment, …)
+├── dist/           generated distribution artifacts — do not edit directly
+│   ├── install.yaml    single-file install (kubectl apply -f <url>)
+│   └── chart/          Helm chart (helm install oci://ghcr.io/…)
 ├── internal/       reconciler logic
 ├── test/           e2e + integration tests
 ├── go.mod
@@ -50,17 +53,28 @@ Inside an operator directory:
 └── README.md       per-operator usage
 ```
 
+`dist/` is always generated — never edited by hand. Regenerate it after
+any change to `api/` or `config/`:
+
+```sh
+make build-installer                      # regenerate dist/install.yaml
+kubebuilder edit --plugins=helm/v2-alpha  # regenerate dist/chart/
+```
+
 ## How operators get deployed
 
-This branch ships *source only*. Deployment to a cluster is the job of
-the [`terraform`](https://github.com/wso2/open-cloud-datacenter/tree/terraform)
-branch's `modules/operators/<name>/` module, which renders the
-`config/default/` kustomize tree into typed Terraform resources +
-points the manager `Deployment` at a published image tag.
+Three paths — all produce identical running state in the cluster:
+
+| Path | Who uses it | How |
+|---|---|---|
+| **Helm** | Public users, open-source adopters | `helm install dbaas oci://ghcr.io/tgcjananga/charts/dbaas-operator` |
+| **Kustomize / make** | Contributors, internal team | `make deploy IMG=<registry>/<name>:<tag>` |
+| **Terraform** | WSO2 automated platform deployment | `terraform` branch `modules/operators/<name>/` renders `config/default/` kustomize tree |
 
 The published images live at whatever GHCR org / registry the consumer
 publishes them to. The kubebuilder `Dockerfile`s here are the source
-for building those images.
+for building those images. CI publishes both the container image and the
+Helm chart to GHCR on every `operators/vX.Y.Z` release tag.
 
 ## Versioning
 

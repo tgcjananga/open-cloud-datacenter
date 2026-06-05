@@ -1,0 +1,40 @@
+DBaaS Operator installed successfully!
+
+Release : {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+Version  : {{ .Chart.AppVersion }}
+
+1. Verify the operator is running:
+
+   kubectl get pods -n {{ .Release.Namespace }}
+   kubectl logs -n {{ .Release.Namespace }} -l control-plane=controller-manager -f
+
+2. Create a PostgreSQL database (edit values to match your cluster):
+
+   cat <<EOF | kubectl apply -f -
+   apiVersion: dbaas.opencloud.wso2.com/v1alpha1
+   kind: DBInstance
+   metadata:
+     name: my-database
+     namespace: <tenant-namespace>
+   spec:
+     dbInstanceClass: db.t3.small
+     allocatedStorage: 20
+     engineVersion: "16"
+     dbName: myapp
+     masterUsername: dbadmin
+     manageMasterUserPassword: true
+     networkRef: <namespace/nad-name>   # existing Multus NAD
+     deletionProtection: true
+     running: true
+   EOF
+
+3. Watch provisioning (takes ~3 minutes on stock Ubuntu images):
+
+   kubectl get dbi -A -w
+
+4. Get connection details once phase=Available:
+
+   kubectl get dbi my-database -n <tenant-namespace> -o yaml
+
+Docs: https://github.com/wso2/open-cloud-datacenter/tree/operators/database

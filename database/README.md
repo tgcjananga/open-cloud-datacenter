@@ -71,14 +71,50 @@ They will be implemented incrementally; the
 schema shape is deliberately stable so users can write manifests today
 that work later.
 
-## Quickstart
+## Install
+
+### Option A — Helm (recommended for public users)
 
 ```sh
-# From inside the dbaas/ directory, with kubectl + docker buildx available:
+helm install dbaas oci://ghcr.io/tgcjananga/charts/dbaas-operator \
+  --version v0.1.0 \
+  --namespace dbaas-system \
+  --create-namespace \
+  --set manager.args="{--leader-elect,--mgmt-logical-switch=ovn-default}"
+```
+
+Upgrade to a new version:
+
+```sh
+helm upgrade dbaas oci://ghcr.io/tgcjananga/charts/dbaas-operator --version <new-version>
+```
+
+Uninstall:
+
+```sh
+helm uninstall dbaas -n dbaas-system
+```
+
+### Option B — Kustomize / make (for contributors and Terraform path)
+
+```sh
+# From inside the database/ directory, with kubectl + docker buildx available:
 make docker-buildx IMG=<registry>/<name>:<tag>
 KUBECONFIG=<your-harvester-kubeconfig> make install
 KUBECONFIG=<your-harvester-kubeconfig> make deploy IMG=<registry>/<name>:<tag>
+```
 
+### Option C — Single-file install
+
+```sh
+kubectl apply -f https://github.com/wso2/open-cloud-datacenter/releases/download/operators-v0.1.0/install.yaml
+```
+
+---
+
+After installing the operator, create a `DBInstance` to provision a database:
+
+```sh
 # Then apply a DBInstance — full YAML and walkthrough in USAGE.md
 kubectl get dbi -A -w
 ```
@@ -96,6 +132,28 @@ make docker-buildx IMG=...              # cross-build linux/amd64, push
 make install                            # apply CRD using current kubeconfig
 make deploy IMG=...                     # apply manager + RBAC
 make undeploy && make uninstall         # tear it all down
+```
+
+## Updating dist/ after config or API changes
+
+`dist/` is generated output — never edit it directly. Regenerate it whenever
+you change `api/v1alpha1/*_types.go` or anything under `config/`:
+
+```sh
+# If you changed api/v1alpha1/*_types.go:
+make manifests          # regenerate CRD YAML from Go types
+make generate           # regenerate zz_generated.deepcopy.go
+
+# Always run these after any config/ or types change:
+make build-installer                        # regenerate dist/install.yaml
+kubebuilder edit --plugins=helm/v2-alpha    # regenerate dist/chart/
+
+# Verify the chart still renders correctly:
+helm lint dist/chart
+helm install dbaas dist/chart --dry-run=client --namespace dbaas-system
+
+# Then commit all three together:
+git add api/ config/ dist/
 ```
 
 ## Part of Open Cloud Datacenter

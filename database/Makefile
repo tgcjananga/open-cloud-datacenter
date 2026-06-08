@@ -150,22 +150,6 @@ build-installer: manifests generate kustomize ## Generate a consolidated YAML wi
 	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
 	"$(KUSTOMIZE)" build config/default > dist/install.yaml
 
-.PHONY: helm-generate
-helm-generate: ## Regenerate Helm chart and move CI workflow to correct location.
-	kubebuilder edit --plugins=helm/v2-alpha
-	@TARGET="../.github/workflows/database-test-chart.yml"; \
-	if [ -f .github/workflows/test-chart.yml ]; then \
-		mkdir -p ../.github/workflows && \
-		mv .github/workflows/test-chart.yml "$$TARGET" && \
-		rm -rf .github/ && \
-		sed -i 's|go-version-file: go\.mod|go-version-file: database/go.mod|g' "$$TARGET" && \
-		sed -i '/go-version-file: database\/go.mod/a\          cache-dependency-path: database/go.sum' "$$TARGET" && \
-		awk '/^    env:/{print "    defaults:"; print "      run:"; print "        working-directory: database"} {print}' "$$TARGET" > "$$TARGET.tmp" && mv "$$TARGET.tmp" "$$TARGET" && \
-		echo "Moved and fixed workflow paths"; \
-	else \
-		echo "No workflow file to move — already in correct location"; \
-	fi
-
 ##@ Deployment
 
 ifndef ignore-not-found
@@ -320,3 +304,19 @@ helm-history: ## Show Helm release history.
 .PHONY: helm-rollback
 helm-rollback: ## Rollback to previous Helm release.
 	$(HELM) rollback $(HELM_RELEASE) --namespace $(HELM_NAMESPACE)
+
+.PHONY: helm-generate
+helm-generate: ## Regenerate Helm chart and move CI workflow to correct location.
+	kubebuilder edit --plugins=helm/v2-alpha
+	@TARGET="../.github/workflows/database-test-chart.yml"; \
+	if [ -f .github/workflows/test-chart.yml ]; then \
+		mkdir -p ../.github/workflows && \
+		mv .github/workflows/test-chart.yml "$$TARGET" && \
+		rm -rf .github/ && \
+		sed -i 's|go-version-file: go\.mod|go-version-file: database/go.mod|g' "$$TARGET" && \
+		sed -i '/go-version-file: database\/go.mod/a\          cache-dependency-path: database/go.sum' "$$TARGET" && \
+		awk '/^    env:/{print "    defaults:"; print "      run:"; print "        working-directory: database"} {print}' "$$TARGET" > "$$TARGET.tmp" && mv "$$TARGET.tmp" "$$TARGET" && \
+		echo "Moved and fixed workflow paths"; \
+	else \
+		echo "No workflow file to move — already in correct location"; \
+	fi

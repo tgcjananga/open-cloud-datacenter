@@ -75,8 +75,13 @@ that work later.
 
 ### Option A — Helm (recommended for public users)
 
+> **Pre-release note:** The official chart is not yet published under `ghcr.io/wso2/`.
+> Until `operators/v1.0.0` is tagged, use a personal registry or the local chart.
+> WSO2 developers: see [`README_DEV.md`](../my-docs/helm/README_DEV.md)
+> for the full pre-release workflow.
+
 ```sh
-helm install dbaas oci://ghcr.io/tgcjananga/charts/dbaas-operator \
+helm install dbaas oci://ghcr.io/<github_username>/charts/dbaas-operator \
   --version 0.1.0 \
   --namespace dbaas-system \
   --create-namespace
@@ -93,7 +98,7 @@ safe to omit — the annotation is silently ignored:
 Helm lifecycle commands:
 
 ```sh
-helm upgrade dbaas oci://ghcr.io/tgcjananga/charts/dbaas-operator --version <new-version>  # upgrade
+helm upgrade dbaas oci://ghcr.io/<github_username>/charts/dbaas-operator --version <new-version>  # upgrade
 helm rollback dbaas 1 -n dbaas-system         # roll back to previous revision
 helm history dbaas -n dbaas-system            # view release history
 helm uninstall dbaas -n dbaas-system          # remove everything
@@ -140,30 +145,50 @@ make undeploy && make uninstall         # tear it all down
 
 ## Updating dist/ after config or API changes
 
-`dist/` is generated output — never edit it directly. Regenerate it whenever
-you change `api/v1alpha1/*_types.go` or anything under `config/`:
+`dist/` is generated output — never edit it directly.
+
+**If only controller logic changed** (`internal/` only — no `types.go` or `config/` changes):
 
 ```sh
-# If you changed api/v1alpha1/*_types.go:
-make manifests          # regenerate CRD YAML from Go types
-make generate           # regenerate zz_generated.deepcopy.go
+make docker-buildx IMG=<registry>/<name>:<tag>   # rebuild image only
+helm upgrade dbaas dist/chart --namespace dbaas-system \
+  --set manager.image.tag=<new-tag>              # no chart regeneration needed
+```
 
-# Always run these after any config/ or types change:
-make build-installer IMG=<registry>/<name>:<tag>  # regenerate dist/install.yaml
-kubebuilder edit --plugins=helm/v2-alpha           # regenerate dist/chart/
+**If `types.go` or `config/` changed:**
 
-# Verify the chart still renders correctly:
+```sh
+# 1. Build image first so the tag is ready for values.yaml
+make docker-buildx IMG=<registry>/<name>:<tag>
+
+# 2. Regenerate CRD (only if types.go changed)
+make manifests
+make generate
+
+# 3. Regenerate dist/chart/ and replace CI workflow file in one command
+make helm-generate
+
+# 4. Re-apply hand-edits to dist/chart/Chart.yaml and dist/chart/values.yaml
+#    (generator resets them — restore version + image + rbac.helpers.enable=true)
+
+# 5. Regenerate dist/install.yaml with real image (single-file path only)
+make build-installer IMG=<registry>/<name>:<tag>
+
+# 6. Verify chart renders correctly
 helm lint dist/chart
 helm install dbaas dist/chart --dry-run=client --namespace dbaas-system
 
-# Commit source + generated output together:
+# 7. Commit source + generated output together
 git add api/ config/ dist/
 git commit -m "feat: <describe your change>"
 
-# For a release — package and push the chart to GHCR:
+# 8. For a release — package and push the chart to GHCR
 helm package dist/chart --version <tag>
-helm push dbaas-operator-<tag>.tgz oci://ghcr.io/tgcjananga/charts
+helm push dbaas-operator-<tag>.tgz oci://ghcr.io/<github_username>/charts
 ```
+
+> For the full developer workflow including local testing options and
+> pre-release instructions, see [`my-docs/helm/README_DEV.md`](../../my-docs/helm/README_DEV.md).
 
 ## Part of Open Cloud Datacenter
 

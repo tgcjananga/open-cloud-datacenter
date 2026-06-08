@@ -2,19 +2,7 @@ name: Test Chart
 
 on:
   push:
-    branches:
-      - operators
-      - helm-chart
-    paths:
-      - database/**
-      - .github/workflows/database-test-chart.yml
   pull_request:
-    branches:
-      - operators
-      - helm-chart
-    paths:
-      - database/**
-      - .github/workflows/database-test-chart.yml
 
 permissions: {}
 
@@ -24,9 +12,6 @@ jobs:
       contents: read
     name: Run on Ubuntu
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: database
     env:
       IMG: controller:latest
     steps:
@@ -38,8 +23,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
         with:
-          go-version-file: database/go.mod
-          cache-dependency-path: database/go.sum
+          go-version-file: go.mod
 
       - name: Install the latest version of kind
         run: |

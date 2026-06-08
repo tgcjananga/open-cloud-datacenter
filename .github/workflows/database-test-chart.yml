@@ -7,12 +7,14 @@ on:
       - helm-chart
     paths:
       - database/**
+      - .github/workflows/database-test-chart.yml
   pull_request:
     branches:
       - operators
       - helm-chart
     paths:
       - database/**
+      - .github/workflows/database-test-chart.yml
 
 permissions: {}
 

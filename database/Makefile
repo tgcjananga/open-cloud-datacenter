@@ -150,6 +150,18 @@ build-installer: manifests generate kustomize ## Generate a consolidated YAML wi
 	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
 	"$(KUSTOMIZE)" build config/default > dist/install.yaml
 
+.PHONY: helm-generate
+helm-generate: build-installer ## Regenerate Helm chart and move CI workflow to correct location.
+	kubebuilder edit --plugins=helm/v2-alpha
+	@if [ -f .github/workflows/test-chart.yml ]; then \
+		mkdir -p ../.github/workflows && \
+		mv .github/workflows/test-chart.yml ../.github/workflows/database-test-chart.yml && \
+		rm -rf .github/ && \
+		echo "Moved workflow to .github/workflows/database-test-chart.yml"; \
+	else \
+		echo "No workflow file to move — already in correct location"; \
+	fi
+
 ##@ Deployment
 
 ifndef ignore-not-found

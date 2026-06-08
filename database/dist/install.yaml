@@ -34,6 +34,9 @@ spec:
     - jsonPath: .status.endpoint.address
       name: Endpoint
       type: string
+    - jsonPath: .spec.description
+      name: Description
+      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -123,6 +126,12 @@ spec:
                   finalizer refuses to tear the instance down.
                   Mutable.
                 type: boolean
+              description:
+                description: |-
+                  Description is a human-readable note about this database instance.
+                  Optional — not used by the reconciler. Added in v0.2.0 for demo purposes.
+                maxLength: 256
+                type: string
               dnsServerIP:
                 description: |-
                   DNSServerIP, when set, pins the VM's resolver via KubeVirt
@@ -817,7 +826,7 @@ spec:
         - --mgmt-logical-switch=ovn-default
         command:
         - /manager
-        image: controller:latest
+        image: ghcr.io/tgcjananga/dbaas-controller:v0.2.0
         livenessProbe:
           httpGet:
             path: /healthz

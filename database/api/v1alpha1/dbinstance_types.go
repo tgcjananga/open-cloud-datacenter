@@ -197,6 +197,12 @@ type DBInstanceSpec struct {
 	// NOT YET IMPLEMENTED — not propagated to child resources or dashboards.
 	// +optional
 	Tags map[string]string `json:"tags,omitempty"`
+
+	// Description is a human-readable note about this database instance.
+	// Optional — not used by the reconciler. Added in v0.2.0 for demo purposes.
+	// +optional
+	// +kubebuilder:validation:MaxLength=256
+	Description string `json:"description,omitempty"`
 }
 
 // SecretKeyRef points to a single key within a K8s Secret.
@@ -369,6 +375,7 @@ type ResourceRefs struct {
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Class",type=string,JSONPath=`.spec.dbInstanceClass`
 // +kubebuilder:printcolumn:name="Endpoint",type=string,JSONPath=`.status.endpoint.address`
+// +kubebuilder:printcolumn:name="Description",type=string,JSONPath=`.spec.description`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // DBInstance represents a managed PostgreSQL database on Harvester HCI.

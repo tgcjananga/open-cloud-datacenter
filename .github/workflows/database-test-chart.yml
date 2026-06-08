@@ -39,6 +39,7 @@ jobs:
         uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
         with:
           go-version-file: database/go.mod
+          cache-dependency-path: database/go.sum
 
       - name: Install the latest version of kind
         run: |

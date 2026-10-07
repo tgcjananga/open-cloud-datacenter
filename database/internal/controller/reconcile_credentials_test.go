@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	kubevirtv1 "kubevirt.io/api/core/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	dbaasv1 "github.com/wso2/open-cloud-datacenter/crds/dbaas/api/v1alpha1"
@@ -76,6 +77,20 @@ func ensureVMObject(t *testing.T, ctx context.Context, r *DBInstanceReconciler, 
 		}
 	} else if err != nil {
 		t.Fatalf("get vm: %v", err)
+	}
+}
+
+// drainRecorder returns every event recorded so far and empties the recorder.
+func drainRecorder(r *DBInstanceReconciler) []string {
+	rec := r.Recorder.(*record.FakeRecorder)
+	var out []string
+	for {
+		select {
+		case e := <-rec.Events:
+			out = append(out, e)
+		default:
+			return out
+		}
 	}
 }
 
@@ -134,17 +149,10 @@ func TestReconcileLostCredentialsSecretIsReportedNotReplaced(t *testing.T) {
 	if stub.CreateVMCalls != 1 {
 		t.Fatalf("CreateVMCalls = %d, want still 1 (no VM rebuilt with a new password)", stub.CreateVMCalls)
 	}
-	var warnings int
-	rec := r.Recorder.(*record.FakeRecorder)
-drain:
-	for {
-		select {
-		case e := <-rec.Events:
-			if strings.Contains(e, "Warning") && strings.Contains(e, "CredentialsLost") {
-				warnings++
-			}
-		default:
-			break drain
+	warnings := 0
+	for _, e := range drainRecorder(r) {
+		if strings.Contains(e, "Warning") && strings.Contains(e, "CredentialsLost") {
+			warnings++
 		}
 	}
 	if warnings != 1 {
@@ -214,5 +222,77 @@ func TestReconcileBYOPasswordReachesCloudInitAndStatus(t *testing.T) {
 	}
 	if string(src.Data["password"]) != userChosenPassword || len(src.OwnerReferences) != 0 {
 		t.Fatalf("the user's Secret was modified: %+v", src)
+	}
+}
+
+// Editing the user's Secret after the database is available is reported once and
+// changes nothing else: the phase, the saved password and the instance's
+// requeue behaviour stay exactly as they were.
+func TestReconcileChangedBYOSourceIsReportedWithoutDisturbingTheDatabase(t *testing.T) {
+	ctx := context.Background()
+	inst := newProvisionInst()
+	inst.Spec.Credentials = &dbaasv1.CredentialsSpec{
+		PasswordSource: dbaasv1.PasswordSource{SecretRef: dbaasv1.PasswordSecretRef{Name: "orders-pw", Key: "password"}},
+	}
+	source := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "tenant-a", Name: "orders-pw", UID: "src-uid", ResourceVersion: "42"},
+		Type:       dbaasv1.PasswordSecretType,
+		Data:       map[string][]byte{"password": []byte(userChosenPassword)},
+	}
+	stub := availableStub()
+	r := newProvisionReconciler(t, stub, inst, source)
+	walkToAvailable(t, ctx, r, inst, stub)
+	drainRecorder(r)
+
+	var live corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: "tenant-a", Name: "orders-pw"}, &live); err != nil {
+		t.Fatal(err)
+	}
+	live.Data["password"] = []byte("edited-after-the-database-was-available")
+	if err := r.Update(ctx, &live); err != nil {
+		t.Fatal(err)
+	}
+
+	key := client.ObjectKeyFromObject(inst)
+	for pass := 1; pass <= 3; pass++ {
+		got := &dbaasv1.DBInstance{}
+		if err := r.Get(ctx, key, got); err != nil {
+			t.Fatal(err)
+		}
+		result, err := runReconcileInstance(ctx, r, got)
+		if err != nil || result != (ctrl.Result{}) {
+			t.Fatalf("pass %d = (%+v, %v), want a quiet zero result", pass, result, err)
+		}
+	}
+
+	after := &dbaasv1.DBInstance{}
+	if err := r.Get(ctx, key, after); err != nil {
+		t.Fatal(err)
+	}
+	if after.Status.Credentials == nil || !after.Status.Credentials.SourceChanged {
+		t.Fatalf("status.credentials = %+v, want SourceChanged=true persisted", after.Status.Credentials)
+	}
+	if after.Status.Phase != dbaasv1.StatusAvailable || !after.Status.IsConditionTrue(dbaasv1.ConditionReady) {
+		t.Fatalf("phase = %q; a changed source must not disturb the database", after.Status.Phase)
+	}
+	if cond := after.Status.GetCondition(dbaasv1.ConditionCredentialsReady); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("CredentialsReady = %+v, want True", cond)
+	}
+	var tenant corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: "tenant-a", Name: "pg-orders-credentials"}, &tenant); err != nil {
+		t.Fatal(err)
+	}
+	if tenant.StringData["admin_password"] != userChosenPassword {
+		t.Fatal("the accepted password changed after the source was edited")
+	}
+
+	warnings := 0
+	for _, e := range drainRecorder(r) {
+		if strings.Contains(e, "Warning") && strings.Contains(e, "PasswordSourceChanged") {
+			warnings++
+		}
+	}
+	if warnings != 1 {
+		t.Fatalf("PasswordSourceChanged warning events over 3 passes = %d, want 1", warnings)
 	}
 }

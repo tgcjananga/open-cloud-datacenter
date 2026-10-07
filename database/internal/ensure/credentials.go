@@ -71,6 +71,8 @@ func (r *credentialsStep) Run(ctx context.Context, inst *dbaasv1.DBInstance) Res
 		return PendingAfter(dbaasv1.ReasonCredentialsCreated, msg, credentialRequeue)
 	}
 
+	r.reportSourceChange(ctx, inst)
+
 	inst.SetCurrentCondition(dbaasv1.ConditionCredentialsReady, metav1.ConditionTrue,
 		dbaasv1.ReasonCredentialsProvisioned, "admin credentials and private material observed")
 	return Satisfied()
@@ -150,4 +152,37 @@ func (d Dependencies) instanceEstablished(ctx context.Context, inst *dbaasv1.DBI
 	default:
 		return false, err
 	}
+}
+
+// reportSourceChange tells the user when the Secret their password was read from
+// has changed since it was accepted. It only reports: the password the database
+// was given does not change, because the accepted copy is what every retry and
+// repave uses (see credentials.Resolver).
+//
+// It compares the Secret's UID and resourceVersion with what was recorded at
+// acceptance and never looks at its contents. "Changed" therefore means the
+// Secret object changed — a label or annotation edit counts, and so does
+// deleting and recreating it — not necessarily the password.
+//
+// The flag is set once and the Warning event is emitted only on that false to
+// true transition, so a changed source does not produce an event every poll.
+// A source that has been deleted, or cannot be read right now, is not reported:
+// the accepted copy makes it irrelevant, and a reporting problem must never
+// block the rest of the reconcile.
+func (r *credentialsStep) reportSourceChange(ctx context.Context, inst *dbaasv1.DBInstance) {
+	st := inst.Status.Credentials
+	if st == nil || st.Source != dbaasv1.CredentialsSourceUserProvidedSecret || st.SourceSecretName == "" || st.SourceChanged {
+		return
+	}
+	var src corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: inst.Namespace, Name: st.SourceSecretName}, &src); err != nil {
+		return
+	}
+	if string(src.UID) == st.SourceUID && src.ResourceVersion == st.SourceResourceVersion {
+		return
+	}
+	st.SourceChanged = true
+	r.Recorder.Eventf(inst, corev1.EventTypeWarning, string(dbaasv1.ReasonPasswordSourceChanged),
+		"Secret %q changed after its password was accepted. The database password was not changed; "+
+			"updating a password on a running database is not supported", st.SourceSecretName)
 }

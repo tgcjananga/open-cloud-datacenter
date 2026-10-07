@@ -586,3 +586,279 @@ func TestEnsureCredentialsEstablishedLookupFailureIsTransient(t *testing.T) {
 	}
 	assertNoSecretsCreated(t, r, inst)
 }
+
+// --- a user's source Secret that changes after its password was accepted ---
+
+func sourceChangedEvents(events []string) []string {
+	var out []string
+	for _, e := range events {
+		if strings.Contains(e, "Warning") && strings.Contains(e, string(dbaasv1.ReasonPasswordSourceChanged)) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// convergedBYO returns a harness whose BYO instance has accepted its password.
+func convergedBYO(t *testing.T) (*testHarness, *dbaasv1.DBInstance) {
+	t.Helper()
+	ctx := context.Background()
+	inst := byoProvisionInst()
+	r := newTestHarness(t, &stubHarvester{}, inst, byoSourceSecret())
+	convergeCredentials(t, ctx, r, inst)
+	drainEvents(r)
+	if c := inst.Status.Credentials; c == nil || c.SourceChanged || c.SourceResourceVersion != "42" {
+		t.Fatalf("precondition: status.credentials = %+v", c)
+	}
+	return r, inst
+}
+
+func editSource(t *testing.T, r *testHarness, mutate func(*corev1.Secret)) {
+	t.Helper()
+	var src corev1.Secret
+	if err := r.Get(context.Background(), types.NamespacedName{Namespace: "tenant-a", Name: "orders-pw"}, &src); err != nil {
+		t.Fatal(err)
+	}
+	mutate(&src)
+	if err := r.Update(context.Background(), &src); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func acceptedPassword(t *testing.T, r *testHarness) string {
+	t.Helper()
+	var sec corev1.Secret
+	if err := r.Get(context.Background(), types.NamespacedName{Namespace: "tenant-a", Name: "pg-orders-credentials"}, &sec); err != nil {
+		t.Fatal(err)
+	}
+	if v := string(sec.Data["admin_password"]); v != "" {
+		return v
+	}
+	return sec.StringData["admin_password"]
+}
+
+func TestEnsureCredentialsReportsAChangedSourceExactlyOnce(t *testing.T) {
+	ctx := context.Background()
+	r, inst := convergedBYO(t)
+	before := acceptedPassword(t, r)
+
+	editSource(t, r, func(s *corev1.Secret) { s.Data["password"] = []byte("edited-after-acceptance") })
+
+	// The very first pass that notices must already leave the recorded identity
+	// at its acceptance-time value; it is persisted at the end of that pass.
+	if res := r.ensureCredentials(ctx, inst); res.Outcome != OutcomeSatisfied {
+		t.Fatalf("first pass result = %+v, want Satisfied", res)
+	}
+	if !inst.Status.Credentials.SourceChanged {
+		t.Fatal("SourceChanged was not set on the pass that noticed the edit")
+	}
+	if c := inst.Status.Credentials; c.SourceResourceVersion != "42" || c.SourceUID != "src-uid" {
+		t.Fatalf("detection overwrote the recorded identity: %+v", c)
+	}
+	for pass := 2; pass <= 4; pass++ {
+		if res := r.ensureCredentials(ctx, inst); res.Outcome != OutcomeSatisfied {
+			t.Fatalf("pass %d result = %+v, want Satisfied (a changed source must not block anything)", pass, res)
+		}
+	}
+
+	events := sourceChangedEvents(drainEvents(r))
+	if len(events) != 1 {
+		t.Fatalf("PasswordSourceChanged warning events = %d (%v), want exactly 1", len(events), events)
+	}
+	if !strings.Contains(events[0], "orders-pw") || strings.Contains(events[0], "edited-after-acceptance") {
+		t.Fatalf("event %q should name the Secret and never contain a password", events[0])
+	}
+	// Reporting only: nothing about the database or the saved copy changes.
+	if got := acceptedPassword(t, r); got != before {
+		t.Fatalf("accepted password changed from %q to %q", before, got)
+	}
+	if inst.Status.Credentials.SourceResourceVersion != "42" || inst.Status.Credentials.SourceUID != "src-uid" {
+		t.Fatalf("the recorded identity must stay the one from acceptance: %+v", inst.Status.Credentials)
+	}
+	if !inst.Status.IsConditionTrue(dbaasv1.ConditionCredentialsReady) {
+		t.Fatal("CredentialsReady must stay True")
+	}
+}
+
+func TestEnsureCredentialsUnchangedSourceReportsNothing(t *testing.T) {
+	ctx := context.Background()
+	r, inst := convergedBYO(t)
+
+	for pass := 0; pass < 4; pass++ {
+		if res := r.ensureCredentials(ctx, inst); res.Outcome != OutcomeSatisfied {
+			t.Fatalf("result = %+v", res)
+		}
+	}
+	if inst.Status.Credentials.SourceChanged {
+		t.Fatal("SourceChanged set although the source was never touched")
+	}
+	if events := drainEvents(r); len(events) != 0 {
+		t.Fatalf("events = %v, want none", events)
+	}
+}
+
+// "Changed" means the Secret object, not necessarily the password: a label edit
+// bumps the resourceVersion too. The event wording and the field docs say so.
+func TestEnsureCredentialsMetadataOnlyEditCountsAsChanged(t *testing.T) {
+	ctx := context.Background()
+	r, inst := convergedBYO(t)
+
+	editSource(t, r, func(s *corev1.Secret) { s.Labels = map[string]string{"team": "orders"} })
+	r.ensureCredentials(ctx, inst)
+
+	if !inst.Status.Credentials.SourceChanged {
+		t.Fatal("a metadata-only edit changes the Secret object and should be reported")
+	}
+}
+
+func TestEnsureCredentialsRecreatedSourceCountsAsChanged(t *testing.T) {
+	ctx := context.Background()
+	r, inst := convergedBYO(t)
+
+	var old corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: "tenant-a", Name: "orders-pw"}, &old); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(ctx, &old); err != nil {
+		t.Fatal(err)
+	}
+	replacement := byoSourceSecret()
+	replacement.ResourceVersion = ""
+	replacement.UID = "a-different-uid"
+	if err := r.Create(ctx, replacement); err != nil {
+		t.Fatal(err)
+	}
+
+	r.ensureCredentials(ctx, inst)
+
+	if !inst.Status.Credentials.SourceChanged {
+		t.Fatal("a deleted and recreated Secret has a new identity and should be reported")
+	}
+}
+
+// A different UID alone is enough. A recreated Secret normally also gets a new
+// resourceVersion, so this pins the UID comparison on its own.
+func TestEnsureCredentialsDifferentUIDAloneCountsAsChanged(t *testing.T) {
+	ctx := context.Background()
+	r, inst := convergedBYO(t)
+
+	var old corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: "tenant-a", Name: "orders-pw"}, &old); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(ctx, &old); err != nil {
+		t.Fatal(err)
+	}
+	replacement := byoSourceSecret()
+	replacement.ResourceVersion = ""
+	replacement.UID = "a-different-uid"
+	if err := r.Create(ctx, replacement); err != nil {
+		t.Fatal(err)
+	}
+	var created corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: "tenant-a", Name: "orders-pw"}, &created); err != nil {
+		t.Fatal(err)
+	}
+	// Make the new Secret's resourceVersion match what was recorded at
+	// acceptance, so only the UID differs. The recorded identity is rewritten
+	// from the saved copy's annotation on every pass, so that is what to change.
+	var saved corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: "tenant-a", Name: "pg-orders-credentials"}, &saved); err != nil {
+		t.Fatal(err)
+	}
+	saved.Annotations[dbaasv1.AnnotationPasswordSourceResourceVersion] = created.ResourceVersion
+	if err := r.Update(ctx, &saved); err != nil {
+		t.Fatal(err)
+	}
+
+	r.ensureCredentials(ctx, inst)
+
+	if !inst.Status.Credentials.SourceChanged {
+		t.Fatal("a Secret with the same resourceVersion but a different UID is a different object and should be reported")
+	}
+}
+
+// Deleting the source after acceptance is harmless — the accepted copy is what
+// is used — so it produces no event, no flag and no error.
+func TestEnsureCredentialsDeletedSourceIsSilent(t *testing.T) {
+	ctx := context.Background()
+	r, inst := convergedBYO(t)
+	before := acceptedPassword(t, r)
+
+	var src corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: "tenant-a", Name: "orders-pw"}, &src); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(ctx, &src); err != nil {
+		t.Fatal(err)
+	}
+
+	for pass := 0; pass < 4; pass++ {
+		if res := r.ensureCredentials(ctx, inst); res.Outcome != OutcomeSatisfied {
+			t.Fatalf("pass %d result = %+v, want Satisfied", pass, res)
+		}
+	}
+	if inst.Status.Credentials.SourceChanged {
+		t.Fatal("deleting the source must not set SourceChanged")
+	}
+	if events := drainEvents(r); len(events) != 0 {
+		t.Fatalf("events = %v, want none", events)
+	}
+	if got := acceptedPassword(t, r); got != before {
+		t.Fatal("the accepted password changed")
+	}
+	if !inst.Status.IsConditionTrue(dbaasv1.ConditionCredentialsReady) {
+		t.Fatal("CredentialsReady must stay True")
+	}
+}
+
+// A reporting problem must never block provisioning or repave.
+func TestEnsureCredentialsUnreadableSourceIsIgnored(t *testing.T) {
+	ctx := context.Background()
+	r, inst := convergedBYO(t)
+	watch, ok := r.Client.(client.WithWatch)
+	if !ok {
+		t.Fatal("fake client does not implement client.WithWatch")
+	}
+	r.Client = interceptor.NewClient(watch, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if key.Name == "orders-pw" {
+				return errors.New("apiserver unavailable")
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+
+	if res := r.ensureCredentials(ctx, inst); res.Outcome != OutcomeSatisfied {
+		t.Fatalf("result = %+v, want Satisfied", res)
+	}
+	if inst.Status.Credentials.SourceChanged || len(drainEvents(r)) != 0 {
+		t.Fatal("an unreadable source must be ignored, not reported")
+	}
+}
+
+func TestEnsureCredentialsGeneratedInstanceNeverChecksASource(t *testing.T) {
+	ctx := context.Background()
+	inst := newProvisionInst()
+	r := newTestHarness(t, &stubHarvester{}, inst)
+	convergeCredentials(t, ctx, r, inst)
+	reads := 0
+	watch, ok := r.Client.(client.WithWatch)
+	if !ok {
+		t.Fatal("fake client does not implement client.WithWatch")
+	}
+	r.Client = interceptor.NewClient(watch, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, isSecret := obj.(*corev1.Secret); isSecret && key.Namespace == "tenant-a" && key.Name != "pg-orders-credentials" {
+				reads++
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+
+	r.ensureCredentials(ctx, inst)
+
+	if reads != 0 || inst.Status.Credentials.SourceChanged {
+		t.Fatalf("a generated instance read %d other Secrets / SourceChanged=%t", reads, inst.Status.Credentials.SourceChanged)
+	}
+}

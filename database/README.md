@@ -57,6 +57,9 @@ segments, for example
 `DBAAS_CONTROLLER__MAX_CONCURRENT_RECONCILES=4`. Flags use canonical dotted
 paths, for example `--controller.maxConcurrentReconciles=4`.
 
+Platform policy switches live under `security`. For example `security.rejectVMPassword` (default off) refuses
+`spec.vmPassword`, which is for development only; see [`INSTALL.md`](./INSTALL.md#production-hardening-reject-vm-password-login).
+
 Configuration changes require an operator Pod restart or Deployment rollout;
 live reload and cloud-backed providers are not enabled in the first release.
 
@@ -105,7 +108,7 @@ Each `DBInstance` (`dbaas.opencloud.wso2.com/v1alpha1`, namespaced) creates:
 | --- | --- |
 | VM (KubeVirt) | One data-net NIC bridged onto the Multus NAD in `spec.networkRef` (must already exist). DHCP by default, or `spec.staticNetwork` for VLANs without one. Address published as `status.endpoint.address`. |
 | PostgreSQL version | `spec.engineVersion` (immutable) is resolved against the target baked image's supported major versions; `bootstrap.sh` drops the OS-default cluster and creates one on the requested version instead. Defaults to that baked image's `DefaultEngineVersion` when unset. |
-| `pg-<name>-credentials` (tenant Secret) | `admin_user` / `admin_password` only. |
+| `pg-<name>-credentials` (tenant Secret) | `admin_user` / `admin_password` only. The password is generated, or copied from a Secret of your own (see [Choosing the master password](#choosing-the-master-password)). |
 | `pg-<name>-connect` (tenant Secret) | `host`, `port`, `dbname`, `jdbcUrl`, `sslmode`, `ca.crt` — no password material. |
 | TLS | Per-instance CA + server cert. Private key material lives in a controller-private Secret in the operator namespace, never exposed to tenants. `pg_hba.conf` enforces `hostssl … scram-sha-256` only; the master role gets `CREATEDB`/`CREATEROLE` but not `SUPERUSER`. |
 | Monitoring | Per-instance Prometheus `Service` + `ServiceMonitor` (exporter install is pending). |
@@ -113,6 +116,27 @@ Each `DBInstance` (`dbaas.opencloud.wso2.com/v1alpha1`, namespaced) creates:
 `dbName` and `masterUsername` are validated against PostgreSQL identifier
 rules (`^[a-zA-Z_][a-zA-Z0-9_$]{0,62}$`) at apply time, so invalid names are
 rejected up front instead of failing later inside cloud-init.
+
+## Choosing the master password
+
+By default the operator generates the master password. To use one of your own, create a Secret of type
+`dbaas.opencloud.wso2.com/master-password` in the instance's namespace and reference it:
+
+```yaml
+spec:
+  credentials:
+    passwordSource:
+      secretRef: {name: orders-db-password, key: password}
+```
+
+The operator reads your Secret once and keeps its own copy for retries and repave; editing or deleting your Secret
+later does not change the database, and your Secret is never deleted by DBaaS. The setting is fixed at creation.
+Either way, the password the database uses is in `pg-<name>-credentials`.
+
+A full example is in
+[`config/samples/dbaas_v1alpha1_dbinstance_byo_password.yaml`](config/samples/dbaas_v1alpha1_dbinstance_byo_password.yaml).
+The rules, status conditions, what teardown removes and the lost-password runbook are in
+[`CREDENTIALS.md`](./CREDENTIALS.md).
 
 ## How it works
 
@@ -138,7 +162,7 @@ them today**:
 
 | Field | Status |
 | --- | --- |
-| `manageMasterUserPassword`, `masterUserPasswordRef` | Ignored; the controller always generates a random admin password. |
+| `manageMasterUserPassword`, `masterUserPasswordRef` | Ignored; the controller generates a random admin password unless `spec.credentials` is set. Use `spec.credentials` for a password of your own; the API rejects combining it with these two. |
 | `s3BackupConfig`, `backupRetentionPeriod`, `preferredBackupWindow` | Recorded but no pgBackRest install, schedule, or retention runs. |
 | `multiAZ` | No Patroni / HA standby is created. |
 | `dbParameterGroupRef` | No `DBParameterGroup` CRD exists in this module. |

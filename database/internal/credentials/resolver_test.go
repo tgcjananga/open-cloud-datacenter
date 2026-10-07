@@ -75,7 +75,7 @@ func TestTenantPasswordGenerationFailureIsReturned(t *testing.T) {
 	t.Cleanup(func() { randomRead = originalRead })
 
 	r := newTestResolver(t)
-	if _, _, _, err := r.getOrCreateTenant(context.Background(), testInst()); !errors.Is(err, boom) {
+	if _, _, err := r.getOrCreateTenant(context.Background(), testInst()); !errors.Is(err, boom) {
 		t.Fatalf("getOrCreateTenant error = %v, want entropy error", err)
 	}
 }

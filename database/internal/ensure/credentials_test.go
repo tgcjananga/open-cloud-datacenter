@@ -198,3 +198,102 @@ func convergeCredentials(t *testing.T, ctx context.Context, r *testHarness, inst
 		t.Fatalf("credential observe result = %+v, want Satisfied", res)
 	}
 }
+
+func byoProvisionInst() *dbaasv1.DBInstance {
+	inst := newProvisionInst()
+	inst.Spec.Credentials = &dbaasv1.CredentialsSpec{
+		PasswordSource: dbaasv1.PasswordSource{SecretRef: dbaasv1.PasswordSecretRef{Name: "orders-pw", Key: "password"}},
+	}
+	return inst
+}
+
+func byoSourceSecret() *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "tenant-a", Name: "orders-pw", UID: "src-uid", ResourceVersion: "42"},
+		Type:       dbaasv1.PasswordSecretType,
+		Data:       map[string][]byte{"password": []byte("a-user-chosen-password")},
+	}
+}
+
+func TestEnsureCredentialsRecordsTheUserProvidedSourceInStatus(t *testing.T) {
+	ctx := context.Background()
+	inst := byoProvisionInst()
+	r := newTestHarness(t, &stubHarvester{}, inst, byoSourceSecret())
+
+	convergeCredentials(t, ctx, r, inst)
+
+	got := inst.Status.Credentials
+	if got == nil {
+		t.Fatal("status.credentials not set")
+	}
+	if got.Source != dbaasv1.CredentialsSourceUserProvidedSecret || got.SourceSecretName != "orders-pw" ||
+		got.SourceUID != "src-uid" || got.SourceResourceVersion != "42" {
+		t.Fatalf("status.credentials = %+v", got)
+	}
+	if got.SourceChanged {
+		t.Fatal("SourceChanged must start false")
+	}
+
+	var tenant corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: "tenant-a", Name: "pg-orders-credentials"}, &tenant); err != nil {
+		t.Fatal(err)
+	}
+	if tenant.StringData["admin_password"] != "a-user-chosen-password" {
+		t.Fatal("credentials Secret does not hold the user-provided password")
+	}
+}
+
+func TestEnsureCredentialsRecordsGeneratedSourceForDefaultInstances(t *testing.T) {
+	ctx := context.Background()
+	inst := newProvisionInst()
+	r := newTestHarness(t, &stubHarvester{}, inst)
+
+	convergeCredentials(t, ctx, r, inst)
+
+	got := inst.Status.Credentials
+	if got == nil || got.Source != dbaasv1.CredentialsSourceGenerated || got.SourceSecretName != "" {
+		t.Fatalf("status.credentials = %+v, want Generated with no source Secret", got)
+	}
+}
+
+// SourceChanged is set by the source-change check, not by resolution. Resolving
+// again on later passes must not reset it.
+func TestEnsureCredentialsDoesNotResetSourceChanged(t *testing.T) {
+	ctx := context.Background()
+	inst := byoProvisionInst()
+	r := newTestHarness(t, &stubHarvester{}, inst, byoSourceSecret())
+	convergeCredentials(t, ctx, r, inst)
+
+	inst.Status.Credentials.SourceChanged = true
+	if res := r.ensureCredentials(ctx, inst); res.Outcome != OutcomeSatisfied {
+		t.Fatalf("result = %+v, want Satisfied", res)
+	}
+	if !inst.Status.Credentials.SourceChanged {
+		t.Fatal("a later resolution pass reset SourceChanged")
+	}
+}
+
+func TestEnsureCredentialsMissingSourceBlocksProvisioningAndCreatesNothing(t *testing.T) {
+	ctx := context.Background()
+	inst := byoProvisionInst()
+	r := newTestHarness(t, &stubHarvester{}, inst) // no source Secret
+
+	res := r.ensureCredentials(ctx, inst)
+
+	if res.Outcome != OutcomeTransient || !errors.Is(res.Err, credentials.ErrPasswordSourceNotFound) {
+		t.Fatalf("result = %+v, want Transient wrapping ErrPasswordSourceNotFound", res)
+	}
+	if inst.Status.IsConditionTrue(dbaasv1.ConditionCredentialsReady) {
+		t.Fatal("CredentialsReady must not be True without a password")
+	}
+	for _, key := range []types.NamespacedName{
+		{Namespace: "tenant-a", Name: "pg-orders-credentials"},
+		{Namespace: "dbaas-system", Name: credentials.InternalSecretName(inst)},
+		{Namespace: "dbaas-system", Name: credentials.TLSSecretName(inst)},
+	} {
+		var sec corev1.Secret
+		if err := r.Get(ctx, key, &sec); err == nil {
+			t.Errorf("Secret %s was created despite the missing source", key)
+		}
+	}
+}

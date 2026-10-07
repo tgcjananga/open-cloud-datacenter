@@ -70,13 +70,40 @@ type Resolver struct {
 type ResolveResult struct {
 	Material *Material
 	Changed  bool
+	// Source says where the accepted master password came from. It is read
+	// from the persisted credentials Secret, so it stays correct on every
+	// later pass without re-reading the user's source Secret.
+	Source SourceInfo
+}
+
+// SourceInfo describes where the accepted master password came from. It never
+// contains the password or anything derived from it.
+type SourceInfo struct {
+	// Source is dbaasv1.CredentialsSourceGenerated or
+	// dbaasv1.CredentialsSourceUserProvidedSecret.
+	Source string
+	// SecretName, SecretUID and ResourceVersion identify the user's Secret at
+	// the moment its password was accepted. Empty when Source is Generated.
+	SecretName      string
+	SecretUID       string
+	ResourceVersion string
+}
+
+// tenantCredentials is what the tenant credentials Secret holds, plus where its
+// password came from.
+type tenantCredentials struct {
+	adminUser     string
+	adminPassword string
+	source        SourceInfo
 }
 
 // Resolve returns the Material for inst, generating and persisting whatever
 // is missing. Existing Secrets are validated but never regenerated or repaired:
 // rotating durable material behind an already-booted VM would break it.
 func (r *Resolver) Resolve(ctx context.Context, inst *dbaasv1.DBInstance) (ResolveResult, error) {
-	adminUser, adminPassword, tenantChanged, err := r.getOrCreateTenant(ctx, inst)
+	// The tenant credentials come first: a missing or unusable user-provided
+	// password source must fail before anything else is created.
+	tenant, tenantChanged, err := r.getOrCreateTenant(ctx, inst)
 	if err != nil {
 		return ResolveResult{}, err
 	}
@@ -92,13 +119,14 @@ func (r *Resolver) Resolve(ctx context.Context, inst *dbaasv1.DBInstance) (Resol
 
 	return ResolveResult{
 		Material: &Material{
-			AdminUser:        adminUser,
-			AdminPassword:    adminPassword,
+			AdminUser:        tenant.adminUser,
+			AdminPassword:    tenant.adminPassword,
 			ReplPassword:     replPw,
 			ExporterPassword: exporterPw,
 			TLS:              tls,
 		},
 		Changed: tenantChanged || internalChanged || tlsChanged,
+		Source:  tenant.source,
 	}, nil
 }
 
@@ -106,55 +134,89 @@ func (r *Resolver) Resolve(ctx context.Context, inst *dbaasv1.DBInstance) (Resol
 // (admin_user/admin_password only). On a concurrent-create race it adopts
 // the winner's material instead of the caller's, so the returned values
 // always match what is actually persisted.
-func (r *Resolver) getOrCreateTenant(ctx context.Context, inst *dbaasv1.DBInstance) (adminUser, adminPassword string, changed bool, err error) {
+//
+// When the Secret does not exist yet, the password comes from the user's
+// Secret (spec.credentials) if one is referenced, otherwise it is generated.
+// Either way the accepted password is then kept in this Secret and is the only
+// place later passes and repaves read it from: the user's Secret is read once,
+// at creation, and never again. Editing or deleting it afterwards cannot make a
+// retry or a repave use a different password than the database was given.
+func (r *Resolver) getOrCreateTenant(ctx context.Context, inst *dbaasv1.DBInstance) (tenantCredentials, bool, error) {
 	key := types.NamespacedName{Namespace: inst.Namespace, Name: TenantCredentialsSecretName(inst)}
 	var sec corev1.Secret
 	if getErr := r.Client.Get(ctx, key, &sec); getErr == nil {
-		adminUser, adminPassword, err = tenantMaterialFrom(&sec, key)
-		return adminUser, adminPassword, false, err
+		creds, err := tenantMaterialFrom(&sec, key)
+		return creds, false, err
 	} else if !apierrors.IsNotFound(getErr) {
-		return "", "", false, getErr
+		return tenantCredentials{}, false, getErr
 	}
 
-	adminUser = inst.Spec.MasterUsername
+	adminUser := inst.Spec.MasterUsername
 	if adminUser == "" {
 		adminUser = r.DefaultMasterUser
 	}
 	if adminUser == "" {
-		return "", "", false, fmt.Errorf("default master user must not be empty")
+		return tenantCredentials{}, false, fmt.Errorf("default master user must not be empty")
 	}
-	adminPassword, err = randomString(32)
-	if err != nil {
-		return "", "", false, fmt.Errorf("generate admin password: %w", err)
+
+	var (
+		adminPassword string
+		source        = SourceInfo{Source: dbaasv1.CredentialsSourceGenerated}
+		annotations   map[string]string
+	)
+	if inst.Spec.Credentials != nil {
+		accepted, err := r.ResolvePasswordSource(ctx, inst)
+		if err != nil {
+			return tenantCredentials{}, false, err
+		}
+		adminPassword = accepted.Password
+		source = SourceInfo{
+			Source:          dbaasv1.CredentialsSourceUserProvidedSecret,
+			SecretName:      inst.Spec.Credentials.PasswordSource.SecretRef.Name,
+			SecretUID:       string(accepted.SecretUID),
+			ResourceVersion: accepted.ResourceVersion,
+		}
+		annotations = map[string]string{
+			dbaasv1.AnnotationPasswordSourceSecret:          source.SecretName,
+			dbaasv1.AnnotationPasswordSourceUID:             source.SecretUID,
+			dbaasv1.AnnotationPasswordSourceResourceVersion: source.ResourceVersion,
+		}
+	} else {
+		var err error
+		adminPassword, err = randomString(32)
+		if err != nil {
+			return tenantCredentials{}, false, fmt.Errorf("generate admin password: %w", err)
+		}
 	}
 
 	newSec := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      key.Name,
-			Namespace: key.Namespace,
-			Labels:    map[string]string{dbaasv1.LabelInstance: inst.Name},
+			Name:        key.Name,
+			Namespace:   key.Namespace,
+			Labels:      map[string]string{dbaasv1.LabelInstance: inst.Name},
+			Annotations: annotations,
 		},
 		Type:       corev1.SecretTypeOpaque,
 		StringData: map[string]string{"admin_user": adminUser, "admin_password": adminPassword},
 	}
 	if r.Scheme != nil {
 		if err := controllerutil.SetControllerReference(inst, newSec, r.Scheme); err != nil {
-			return "", "", false, err
+			return tenantCredentials{}, false, err
 		}
 	}
 	if err := r.Client.Create(ctx, newSec); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
-			return "", "", false, err
+			return tenantCredentials{}, false, err
 		}
 		// race winner already created the secret
 		var won corev1.Secret
 		if gerr := r.Client.Get(ctx, key, &won); gerr != nil {
-			return "", "", false, gerr
+			return tenantCredentials{}, false, gerr
 		}
-		adminUser, adminPassword, err = tenantMaterialFrom(&won, key)
-		return adminUser, adminPassword, true, err
+		creds, err := tenantMaterialFrom(&won, key)
+		return creds, true, err
 	}
-	return adminUser, adminPassword, true, nil
+	return tenantCredentials{adminUser: adminUser, adminPassword: adminPassword, source: source}, true, nil
 }
 
 // getOrCreateInternal resolves the operator-namespace internal-credentials
@@ -261,12 +323,29 @@ func get(s *corev1.Secret, key string) string {
 	return s.StringData[key]
 }
 
-func tenantMaterialFrom(s *corev1.Secret, key types.NamespacedName) (string, string, error) {
+func tenantMaterialFrom(s *corev1.Secret, key types.NamespacedName) (tenantCredentials, error) {
 	user, password := get(s, "admin_user"), get(s, "admin_password")
 	if user == "" || password == "" {
-		return "", "", fmt.Errorf("credentials secret %s/%s is missing admin_user or admin_password", key.Namespace, key.Name)
+		return tenantCredentials{}, fmt.Errorf("credentials secret %s/%s is missing admin_user or admin_password", key.Namespace, key.Name)
 	}
-	return user, password, nil
+	return tenantCredentials{adminUser: user, adminPassword: password, source: sourceInfoFrom(s)}, nil
+}
+
+// sourceInfoFrom reads where a persisted credentials Secret's password came
+// from. A Secret without the source annotations was generated by the
+// controller, which includes every Secret created before user-provided
+// passwords existed.
+func sourceInfoFrom(s *corev1.Secret) SourceInfo {
+	name := s.Annotations[dbaasv1.AnnotationPasswordSourceSecret]
+	if name == "" {
+		return SourceInfo{Source: dbaasv1.CredentialsSourceGenerated}
+	}
+	return SourceInfo{
+		Source:          dbaasv1.CredentialsSourceUserProvidedSecret,
+		SecretName:      name,
+		SecretUID:       s.Annotations[dbaasv1.AnnotationPasswordSourceUID],
+		ResourceVersion: s.Annotations[dbaasv1.AnnotationPasswordSourceResourceVersion],
+	}
 }
 
 func internalMaterialFrom(s *corev1.Secret, key types.NamespacedName) (string, string, error) {

@@ -54,6 +54,7 @@ func (r *credentialsStep) Run(ctx context.Context, inst *dbaasv1.DBInstance) Res
 	inst.Status.Resources.AdminCredentialsSecretName = credentials.TenantCredentialsSecretName(inst)
 	inst.Status.Resources.InternalSecretRef = fmt.Sprintf("%s/%s", opNS, credentials.InternalSecretName(inst))
 	inst.Status.Resources.PrivateTLSSecretRef = fmt.Sprintf("%s/%s", opNS, credentials.TLSSecretName(inst))
+	recordCredentialsSource(inst, result.Source)
 	if result.Changed {
 		msg := "credential material created; waiting for observation"
 		inst.SetCurrentCondition(dbaasv1.ConditionCredentialsReady, metav1.ConditionTrue,
@@ -65,4 +66,19 @@ func (r *credentialsStep) Run(ctx context.Context, inst *dbaasv1.DBInstance) Res
 	inst.SetCurrentCondition(dbaasv1.ConditionCredentialsReady, metav1.ConditionTrue,
 		dbaasv1.ReasonCredentialsProvisioned, "admin credentials and private material observed")
 	return Satisfied()
+}
+
+// recordCredentialsSource publishes where the accepted master password came
+// from. It updates the fields in place rather than replacing the struct, so
+// SourceChanged — set by the source-change check, not by resolution — survives
+// every pass.
+func recordCredentialsSource(inst *dbaasv1.DBInstance, src credentials.SourceInfo) {
+	if inst.Status.Credentials == nil {
+		inst.Status.Credentials = &dbaasv1.CredentialsStatus{}
+	}
+	st := inst.Status.Credentials
+	st.Source = src.Source
+	st.SourceSecretName = src.SecretName
+	st.SourceUID = src.SecretUID
+	st.SourceResourceVersion = src.ResourceVersion
 }

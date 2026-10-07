@@ -75,6 +75,8 @@ spec:
                 - implemented immutable post-create (modify is refused): networkRef,
                   dbName, masterUsername, port, storageType, staticNetwork,
                   vmPassword, engineVersion
+                - implemented immutable post-create via a whole-spec rule: credentials
+                  (API accepted; applied once password-source resolution lands)
                 - NOT IMPLEMENTED: manageMasterUserPassword, masterUserPasswordRef,
                   multiAZ, dbParameterGroupRef, tags, s3BackupConfig,
                   backupRetentionPeriod, preferredBackupWindow. These fields exist in
@@ -86,6 +88,11 @@ spec:
               masterUsername, port, storageType) are compared post-defaulting in
               immutableDrift(), so a raw CEL rule on them would be stricter than that
               check — see immutableDrift's doc comment.
+
+              credentials is also immutable, but through a rule on the whole spec rather
+              than on the field: a per-field "self == oldSelf" is skipped when the field
+              was unset on the old object, so it would let credentials be added to an
+              instance whose database already has a password.
             properties:
               allocatedStorage:
                 description: |-
@@ -107,6 +114,52 @@ spec:
                   enforcement runs today. The field is recorded but inert.
                 minimum: 0
                 type: integer
+              credentials:
+                description: |-
+                  Credentials selects where the master password comes from. Omit it to
+                  have the controller generate one (the default, and the only behavior
+                  before this field existed).
+                  A creation-time input: the controller reads the referenced Secret once,
+                  keeps its own copy for retries and repave, and never re-reads it for the
+                  password. Editing or deleting the source Secret afterwards does not
+                  change the database.
+                  Immutable after creation.
+                  NOT YET APPLIED: the API accepts this field but the controller does not
+                  read it until the password-source resolution lands.
+                properties:
+                  passwordSource:
+                    description: PasswordSource is where the master password comes
+                      from.
+                    properties:
+                      secretRef:
+                        description: |-
+                          SecretRef points to a Secret in the DBInstance's own namespace that
+                          holds the password. DBaaS never modifies or deletes this Secret.
+                        properties:
+                          key:
+                            description: Key within the Secret's data that holds the
+                              password.
+                            maxLength: 253
+                            minLength: 1
+                            pattern: ^[-._a-zA-Z0-9]+$
+                            type: string
+                          name:
+                            description: Name of the Secret, in the same namespace
+                              as the DBInstance.
+                            maxLength: 253
+                            minLength: 1
+                            pattern: ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
+                    required:
+                    - secretRef
+                    type: object
+                required:
+                - passwordSource
+                type: object
               dbInstanceClass:
                 description: |-
                   DBInstanceClass maps to VM CPU/RAM. e.g. "db.t3.medium", "db.m5.large".
@@ -323,6 +376,14 @@ spec:
             - dbInstanceClass
             - networkRef
             type: object
+            x-kubernetes-validations:
+            - message: credentials is immutable after creation
+              rule: has(self.credentials) == has(oldSelf.credentials) && (!has(self.credentials)
+                || self.credentials == oldSelf.credentials)
+            - message: credentials cannot be combined with the reserved manageMasterUserPassword
+                or masterUserPasswordRef fields
+              rule: '!has(self.credentials) || (!has(self.masterUserPasswordRef) &&
+                !(has(self.manageMasterUserPassword) && self.manageMasterUserPassword))'
           status:
             description: DBInstanceStatus defines the observed state of a DBInstance.
             properties:
@@ -445,6 +506,38 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              credentials:
+                description: |-
+                  Credentials reports where the accepted master password came from. It
+                  never contains the password.
+                properties:
+                  source:
+                    description: Source is how the accepted password was obtained.
+                    enum:
+                    - Generated
+                    - UserProvidedSecret
+                    type: string
+                  sourceChanged:
+                    description: |-
+                      SourceChanged is true once the source Secret object has changed since
+                      it was accepted. The database password is not affected: runtime updates
+                      from a changed source are not supported.
+                    type: boolean
+                  sourceResourceVersion:
+                    description: |-
+                      SourceResourceVersion is the Secret's resourceVersion when the password
+                      was accepted. A later difference means the Secret object changed (this
+                      includes label or annotation edits, not only the password).
+                    type: string
+                  sourceSecretName:
+                    description: SourceSecretName is the user's Secret, when Source
+                      is UserProvidedSecret.
+                    type: string
+                  sourceUID:
+                    description: SourceUID is the UID of that Secret when the password
+                      was accepted.
+                    type: string
+                type: object
               currentImageRevision:
                 description: |-
                   CurrentImageRevision is the baked image revision (internal/catalog

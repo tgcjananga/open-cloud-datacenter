@@ -28,6 +28,8 @@ import (
 //   - implemented immutable post-create (modify is refused): networkRef,
 //     dbName, masterUsername, port, storageType, staticNetwork,
 //     vmPassword, engineVersion
+//   - implemented immutable post-create via a whole-spec rule: credentials
+//     (API accepted; applied once password-source resolution lands)
 //   - NOT IMPLEMENTED: manageMasterUserPassword, masterUserPasswordRef,
 //     multiAZ, dbParameterGroupRef, tags, s3BackupConfig,
 //     backupRetentionPeriod, preferredBackupWindow. These fields exist in
@@ -39,6 +41,13 @@ import (
 // masterUsername, port, storageType) are compared post-defaulting in
 // immutableDrift(), so a raw CEL rule on them would be stricter than that
 // check — see immutableDrift's doc comment.
+//
+// credentials is also immutable, but through a rule on the whole spec rather
+// than on the field: a per-field "self == oldSelf" is skipped when the field
+// was unset on the old object, so it would let credentials be added to an
+// instance whose database already has a password.
+// +kubebuilder:validation:XValidation:rule="has(self.credentials) == has(oldSelf.credentials) && (!has(self.credentials) || self.credentials == oldSelf.credentials)",message="credentials is immutable after creation"
+// +kubebuilder:validation:XValidation:rule="!has(self.credentials) || (!has(self.masterUserPasswordRef) && !(has(self.manageMasterUserPassword) && self.manageMasterUserPassword))",message="credentials cannot be combined with the reserved manageMasterUserPassword or masterUserPasswordRef fields"
 type DBInstanceSpec struct {
 	// DBInstanceClass maps to VM CPU/RAM. e.g. "db.t3.medium", "db.m5.large".
 	// Mutable: changing the class on an Available instance resizes the VM.
@@ -102,6 +111,19 @@ type DBInstanceSpec struct {
 	// NOT YET IMPLEMENTED — see ManageMasterUserPassword.
 	// +optional
 	MasterUserPasswordRef *SecretKeyRef `json:"masterUserPasswordRef,omitempty"`
+
+	// Credentials selects where the master password comes from. Omit it to
+	// have the controller generate one (the default, and the only behavior
+	// before this field existed).
+	// A creation-time input: the controller reads the referenced Secret once,
+	// keeps its own copy for retries and repave, and never re-reads it for the
+	// password. Editing or deleting the source Secret afterwards does not
+	// change the database.
+	// Immutable after creation.
+	// NOT YET APPLIED: the API accepts this field but the controller does not
+	// read it until the password-source resolution lands.
+	// +optional
+	Credentials *CredentialsSpec `json:"credentials,omitempty"`
 
 	// AllocatedStorage in GiB.
 	// Mutable but grow-only: changing this on an Available instance resizes the
@@ -215,6 +237,78 @@ type SecretKeyRef struct {
 	Key  string `json:"key"`
 }
 
+// CredentialsSpec describes how the master password is provided.
+type CredentialsSpec struct {
+	// PasswordSource is where the master password comes from.
+	// +required
+	PasswordSource PasswordSource `json:"passwordSource"`
+}
+
+// PasswordSource names the origin of the master password. SecretRef is the
+// only source today; other sources can be added alongside it later without
+// breaking existing manifests.
+type PasswordSource struct {
+	// SecretRef points to a Secret in the DBInstance's own namespace that
+	// holds the password. DBaaS never modifies or deletes this Secret.
+	// +required
+	SecretRef PasswordSecretRef `json:"secretRef"`
+}
+
+// PasswordSecretRef points to one key in a same-namespace Secret.
+type PasswordSecretRef struct {
+	// Name of the Secret, in the same namespace as the DBInstance.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$`
+	Name string `json:"name"`
+
+	// Key within the Secret's data that holds the password.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[-._a-zA-Z0-9]+$`
+	Key string `json:"key"`
+}
+
+// CredentialsSource values for CredentialsStatus.Source.
+const (
+	// CredentialsSourceGenerated means the controller generated the password.
+	CredentialsSourceGenerated = "Generated"
+	// CredentialsSourceUserProvidedSecret means the password came from the
+	// user's Secret referenced by spec.credentials.passwordSource.secretRef.
+	CredentialsSourceUserProvidedSecret = "UserProvidedSecret"
+)
+
+// CredentialsStatus reports where the accepted master password came from. It
+// never holds the password or anything derived from it.
+type CredentialsStatus struct {
+	// Source is how the accepted password was obtained.
+	// +optional
+	// +kubebuilder:validation:Enum=Generated;UserProvidedSecret
+	Source string `json:"source,omitempty"`
+
+	// SourceSecretName is the user's Secret, when Source is UserProvidedSecret.
+	// +optional
+	SourceSecretName string `json:"sourceSecretName,omitempty"`
+
+	// SourceUID is the UID of that Secret when the password was accepted.
+	// +optional
+	SourceUID string `json:"sourceUID,omitempty"`
+
+	// SourceResourceVersion is the Secret's resourceVersion when the password
+	// was accepted. A later difference means the Secret object changed (this
+	// includes label or annotation edits, not only the password).
+	// +optional
+	SourceResourceVersion string `json:"sourceResourceVersion,omitempty"`
+
+	// SourceChanged is true once the source Secret object has changed since
+	// it was accepted. The database password is not affected: runtime updates
+	// from a changed source are not supported.
+	// +optional
+	SourceChanged bool `json:"sourceChanged,omitempty"`
+}
+
 // NetworkConfig is a static IPv4 configuration for the database VM's data
 // NIC. When set on DBInstanceSpec.StaticNetwork, these values are written
 // into cloud-init's netplan in place of `dhcp4: true`.
@@ -275,6 +369,11 @@ type DBInstanceStatus struct {
 	// Resources tracks managed resource references used by clients and cleanup.
 	// +optional
 	Resources ResourceRefs `json:"resources,omitempty"`
+
+	// Credentials reports where the accepted master password came from. It
+	// never contains the password.
+	// +optional
+	Credentials *CredentialsStatus `json:"credentials,omitempty"`
 
 	// GrafanaURL is the per-instance Grafana dashboard URL.
 	// +optional

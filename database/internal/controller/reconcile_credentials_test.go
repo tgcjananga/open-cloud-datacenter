@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	dbaasv1 "github.com/wso2/open-cloud-datacenter/crds/dbaas/api/v1alpha1"
+	operatorconfig "github.com/wso2/open-cloud-datacenter/crds/dbaas/internal/config"
 	"github.com/wso2/open-cloud-datacenter/crds/dbaas/internal/harvester"
 )
 
@@ -294,5 +295,49 @@ func TestReconcileChangedBYOSourceIsReportedWithoutDisturbingTheDatabase(t *test
 	}
 	if warnings != 1 {
 		t.Fatalf("PasswordSourceChanged warning events over 3 passes = %d, want 1", warnings)
+	}
+}
+
+// Through the real chain: with the policy on, a new instance that sets
+// vmPassword is rejected before anything is created — no Secrets, no VM — and
+// is reported the way any other rejected spec is.
+func TestReconcileRejectsVMPasswordWhenPolicyIsOnAndCreatesNothing(t *testing.T) {
+	ctx := context.Background()
+	inst := newProvisionInst()
+	inst.Spec.VMPassword = "console-pw-should-never-be-used"
+	stub := availableStub()
+	r := newProvisionReconciler(t, stub, inst)
+	r.Security = operatorconfig.SecurityConfig{RejectVMPassword: true}
+	resetEnsureRunner(r)
+
+	result, err := runReconcileInstance(ctx, r, inst)
+	if err != nil || result != (ctrl.Result{}) {
+		t.Fatalf("result = (%+v, %v), want a parked Terminal with no error and no requeue", result, err)
+	}
+
+	got := &dbaasv1.DBInstance{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(inst), got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != dbaasv1.StatusIncompatibleParameters {
+		t.Fatalf("phase = %q, want incompatible-parameters", got.Status.Phase)
+	}
+	accepted := got.Status.GetCondition(dbaasv1.ConditionAccepted)
+	if accepted == nil || accepted.Status != metav1.ConditionFalse || accepted.Reason != string(dbaasv1.ReasonVMPasswordNotAllowed) {
+		t.Fatalf("Accepted = %+v, want False/VMPasswordNotAllowed", accepted)
+	}
+	if stub.CreateVMCalls != 0 {
+		t.Fatalf("CreateVMCalls = %d, want 0", stub.CreateVMCalls)
+	}
+	for _, key := range []types.NamespacedName{
+		{Namespace: "tenant-a", Name: "pg-orders-credentials"},
+		{Namespace: "dbaas-system", Name: "dbi-orders-uid-internal"},
+		{Namespace: "dbaas-system", Name: "dbi-orders-uid-tls"},
+		{Namespace: "tenant-a", Name: "pg-orders-cloudinit"},
+	} {
+		var sec corev1.Secret
+		if err := r.Get(ctx, key, &sec); err == nil {
+			t.Errorf("Secret %s was created for a rejected instance", key)
+		}
 	}
 }

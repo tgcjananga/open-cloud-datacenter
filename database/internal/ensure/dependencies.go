@@ -38,6 +38,7 @@ type Dependencies struct {
 	DatabaseDefaults  operatorconfig.DatabaseDefaults
 	InstanceClasses   map[string]dbaasv1.InstanceClassSpec
 	Monitoring        operatorconfig.MonitoringConfig
+	Security          operatorconfig.SecurityConfig
 }
 
 func (d Dependencies) credentialsResolver() *credentials.Resolver {

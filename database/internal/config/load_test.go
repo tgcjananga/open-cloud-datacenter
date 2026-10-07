@@ -233,3 +233,51 @@ func clearConfigurationEnvironment(t *testing.T) {
 		}
 	}
 }
+
+func TestRejectVMPasswordIsOffByDefault(t *testing.T) {
+	clearConfigurationEnvironment(t)
+	if Default().Security.RejectVMPassword {
+		t.Fatal("security.rejectVMPassword must default to false so enabling it is an explicit decision")
+	}
+	got, err := Load(flag.NewFlagSet("test", flag.ContinueOnError), nil)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got.Security.RejectVMPassword {
+		t.Fatal("RejectVMPassword = true with nothing configured")
+	}
+}
+
+func TestRejectVMPasswordCanBeSetFromFileEnvironmentOrFlag(t *testing.T) {
+	t.Run("file", func(t *testing.T) {
+		clearConfigurationEnvironment(t)
+		path := writeConfig(t, `{"security": {"rejectVMPassword": true}}`)
+		got, err := load(flag.NewFlagSet("test", flag.ContinueOnError), nil, path)
+		if err != nil || !got.Security.RejectVMPassword {
+			t.Fatalf("file: RejectVMPassword = %t, err = %v", got.Security.RejectVMPassword, err)
+		}
+	})
+	t.Run("environment", func(t *testing.T) {
+		clearConfigurationEnvironment(t)
+		t.Setenv("DBAAS_SECURITY__REJECT_VM_PASSWORD", "true")
+		got, err := Load(flag.NewFlagSet("test", flag.ContinueOnError), nil)
+		if err != nil || !got.Security.RejectVMPassword {
+			t.Fatalf("environment: RejectVMPassword = %t, err = %v", got.Security.RejectVMPassword, err)
+		}
+	})
+	t.Run("flag", func(t *testing.T) {
+		clearConfigurationEnvironment(t)
+		got, err := Load(flag.NewFlagSet("test", flag.ContinueOnError), []string{"--security.rejectVMPassword=true"})
+		if err != nil || !got.Security.RejectVMPassword {
+			t.Fatalf("flag: RejectVMPassword = %t, err = %v", got.Security.RejectVMPassword, err)
+		}
+	})
+	t.Run("explicit flag turns a file setting back off", func(t *testing.T) {
+		clearConfigurationEnvironment(t)
+		path := writeConfig(t, `{"security": {"rejectVMPassword": true}}`)
+		got, err := load(flag.NewFlagSet("test", flag.ContinueOnError), []string{"--security.rejectVMPassword=false"}, path)
+		if err != nil || got.Security.RejectVMPassword {
+			t.Fatalf("flag override: RejectVMPassword = %t, err = %v", got.Security.RejectVMPassword, err)
+		}
+	})
+}

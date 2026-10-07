@@ -144,6 +144,15 @@ func (r *vmStep) createVM(ctx context.Context, inst *dbaasv1.DBInstance) Result 
 		return Terminal(dbaasv1.ReasonInvalidClass, msg)
 	}
 
+	// Defence in depth: preflight already refuses this, but provisioning must
+	// never be the thing that applies a rejected password, whatever the order of
+	// the steps. Not applied to an existing instance whose VM is being rebuilt.
+	if r.vmPasswordRejected(inst) {
+		inst.SetCurrentCondition(dbaasv1.ConditionPreflightReady, metav1.ConditionFalse,
+			dbaasv1.ReasonVMPasswordNotAllowed, vmPasswordRejectedMessage)
+		return Terminal(dbaasv1.ReasonVMPasswordNotAllowed, vmPasswordRejectedMessage)
+	}
+
 	defaults := r.databaseDefaults()
 	masterUser := inst.Spec.MasterUsername
 	if masterUser == "" {

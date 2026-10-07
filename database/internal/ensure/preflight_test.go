@@ -19,6 +19,7 @@ package ensure
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -322,5 +323,84 @@ func TestEnsurePreflightImageAPIFailureIsTransient(t *testing.T) {
 	cond := inst.Status.GetCondition(dbaasv1.ConditionPreflightReady)
 	if cond == nil || cond.Status != metav1.ConditionUnknown || cond.Reason != string(dbaasv1.ReasonValidationPending) {
 		t.Fatalf("PreflightReady = %+v, want Unknown/ValidationPending", cond)
+	}
+}
+
+// --- security.rejectVMPassword ---
+
+const consolePasswordMarker = "CONSOLE-PW-MARKER-9f3"
+
+func harnessRejectingVMPassword(stub *stubHarvester, reject bool) *testHarness {
+	return &testHarness{Dependencies: Dependencies{
+		Harvester: stub,
+		Security:  operatorconfig.SecurityConfig{RejectVMPassword: reject},
+	}}
+}
+
+func TestEnsurePreflightRejectsNewInstanceWithVMPasswordWhenPolicyIsOn(t *testing.T) {
+	stub := &stubHarvester{}
+	r := harnessRejectingVMPassword(stub, true)
+	inst := newProvisionInst()
+	inst.Spec.VMPassword = consolePasswordMarker
+
+	res := r.ensurePreflight(context.Background(), inst)
+
+	if res.Outcome != OutcomeTerminal || res.Reason != dbaasv1.ReasonVMPasswordNotAllowed {
+		t.Fatalf("res = %+v, want Terminal/VMPasswordNotAllowed", res)
+	}
+	cond := inst.Status.GetCondition(dbaasv1.ConditionPreflightReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != string(dbaasv1.ReasonVMPasswordNotAllowed) {
+		t.Fatalf("PreflightReady = %+v, want False/VMPasswordNotAllowed", cond)
+	}
+	if strings.Contains(cond.Message, consolePasswordMarker) || strings.Contains(res.Message, consolePasswordMarker) {
+		t.Fatalf("message must never echo the password: %q", cond.Message)
+	}
+	if !strings.Contains(cond.Message, "spec.vmPassword") {
+		t.Errorf("message %q should name the offending field", cond.Message)
+	}
+	if stub.LastVMImageRef != "" {
+		t.Fatalf("the image must not be looked up for a rejected spec, got %q", stub.LastVMImageRef)
+	}
+}
+
+func TestEnsurePreflightAllowsVMPasswordWhenPolicyIsOff(t *testing.T) {
+	r := harnessRejectingVMPassword(&stubHarvester{}, false)
+	inst := newProvisionInst()
+	inst.Spec.VMPassword = consolePasswordMarker
+
+	if res := r.ensurePreflight(context.Background(), inst); res.Outcome != OutcomeSatisfied {
+		t.Fatalf("res = %+v, want Satisfied with the policy off (default)", res)
+	}
+}
+
+func TestEnsurePreflightAllowsNewInstanceWithoutVMPasswordWhenPolicyIsOn(t *testing.T) {
+	r := harnessRejectingVMPassword(&stubHarvester{}, true)
+
+	if res := r.ensurePreflight(context.Background(), newProvisionInst()); res.Outcome != OutcomeSatisfied {
+		t.Fatalf("res = %+v, want Satisfied", res)
+	}
+}
+
+// Turning the policy on later must never retroactively fail a database that is
+// already running with a vmPassword: it is immutable, so there is nothing the
+// owner could change, and it would flip a healthy instance to
+// incompatible-parameters.
+func TestEnsurePreflightLeavesExistingInstanceWithVMPasswordAlone(t *testing.T) {
+	stub := &stubHarvester{}
+	r := harnessRejectingVMPassword(stub, true)
+	inst := newProvisionInst()
+	inst.Spec.VMPassword = consolePasswordMarker
+	inst.Status.AppliedSpec = &dbaasv1.AppliedSpec{
+		NetworkRef: inst.Spec.NetworkRef, EngineVersion: inst.Spec.EngineVersion, VMPassword: consolePasswordMarker,
+	}
+	inst.Status.CurrentImageRevision = "old-revision"
+
+	res := r.ensurePreflight(context.Background(), inst)
+
+	if res.Outcome != OutcomeSatisfied {
+		t.Fatalf("res = %+v, want Satisfied — an existing instance must never be rejected by this policy", res)
+	}
+	if cond := inst.Status.GetCondition(dbaasv1.ConditionPreflightReady); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("PreflightReady = %+v, want True", cond)
 	}
 }

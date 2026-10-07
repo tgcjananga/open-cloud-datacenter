@@ -293,3 +293,65 @@ func TestEnsureVMCreateErrorIsTransientAndRecordsRefs(t *testing.T) {
 		t.Fatalf("Resources = %+v, want refs recorded despite create error", refs)
 	}
 }
+
+// Provisioning must never be the thing that applies a rejected password, even
+// if preflight were skipped or reordered.
+func TestEnsureVMRefusesToCreateWithAVMPasswordWhenPolicyIsOn(t *testing.T) {
+	ctx := context.Background()
+	inst := newProvisionInst()
+	inst.Spec.VMPassword = consolePasswordMarker
+	stub := &stubHarvester{}
+	r := newTestHarness(t, stub, inst)
+	r.Security.RejectVMPassword = true
+	convergeCredentials(t, ctx, r, inst)
+
+	res := r.ensureVM(ctx, inst)
+
+	if res.Outcome != OutcomeTerminal || res.Reason != dbaasv1.ReasonVMPasswordNotAllowed {
+		t.Fatalf("res = %+v, want Terminal/VMPasswordNotAllowed", res)
+	}
+	if stub.CreateVMCalls != 0 {
+		t.Fatalf("CreateVMCalls = %d, want 0 — the VM must not be created", stub.CreateVMCalls)
+	}
+	if inst.Status.AppliedSpec != nil {
+		t.Fatal("AppliedSpec must not be recorded for a VM that was never created")
+	}
+	var ci corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: "tenant-a", Name: "pg-orders-cloudinit"}, &ci); err == nil {
+		t.Fatal("a cloud-init Secret carrying the rejected password was written")
+	}
+}
+
+// An existing instance whose VM is gone (deleted out of band) is rebuilt as it
+// was — including its vmPassword — because it is immutable and that rebuild
+// recreates the same VM, not a new request.
+func TestEnsureVMStillRebuildsAnExistingInstanceWithItsVMPassword(t *testing.T) {
+	ctx := context.Background()
+	inst := newProvisionInst()
+	inst.Spec.VMPassword = consolePasswordMarker
+	inst.Status.Resources.VMName = "pg-orders"
+	inst.Status.AppliedSpec = &dbaasv1.AppliedSpec{NetworkRef: inst.Spec.NetworkRef, VMPassword: consolePasswordMarker}
+	stub := &stubHarvester{}
+	r := newTestHarness(t, stub, inst) // no VM object: it was deleted out of band
+	r.Security.RejectVMPassword = true
+	seedDurableCredentials(t, ctx, r, inst)
+
+	res := r.ensureVM(ctx, inst)
+
+	if res.Outcome != OutcomePending || stub.CreateVMCalls != 1 {
+		t.Fatalf("res = %+v CreateVMCalls = %d, want Pending and 1 rebuild", res, stub.CreateVMCalls)
+	}
+}
+
+func TestEnsureVMCreatesWithVMPasswordWhenPolicyIsOff(t *testing.T) {
+	ctx := context.Background()
+	inst := newProvisionInst()
+	inst.Spec.VMPassword = consolePasswordMarker
+	stub := &stubHarvester{}
+	r := newTestHarness(t, stub, inst)
+	convergeCredentials(t, ctx, r, inst)
+
+	if res := r.ensureVM(ctx, inst); res.Outcome != OutcomePending || stub.CreateVMCalls != 1 {
+		t.Fatalf("res = %+v CreateVMCalls = %d, want the VM created", res, stub.CreateVMCalls)
+	}
+}

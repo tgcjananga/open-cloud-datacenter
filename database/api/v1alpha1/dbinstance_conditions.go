@@ -79,6 +79,7 @@ const (
 	ReasonOSImageNotFound             ConditionReason = "OSImageNotFound"
 	ReasonOSImageNotReady             ConditionReason = "OSImageNotReady"
 	ReasonImmutableFieldChanged       ConditionReason = "ImmutableFieldChanged"
+	ReasonVMPasswordNotAllowed        ConditionReason = "VMPasswordNotAllowed"
 	ReasonPreflightPassed             ConditionReason = "PreflightPassed"
 	ReasonCredentialsResolveFailed    ConditionReason = "CredentialsResolveFailed"
 	ReasonCredentialsCreated          ConditionReason = "CredentialsCreated"
@@ -152,6 +153,7 @@ var knownConditionReasons = map[string]ConditionReason{
 	string(ReasonOSImageNotFound):             ReasonOSImageNotFound,
 	string(ReasonOSImageNotReady):             ReasonOSImageNotReady,
 	string(ReasonImmutableFieldChanged):       ReasonImmutableFieldChanged,
+	string(ReasonVMPasswordNotAllowed):        ReasonVMPasswordNotAllowed,
 	string(ReasonPreflightPassed):             ReasonPreflightPassed,
 	string(ReasonCredentialsResolveFailed):    ReasonCredentialsResolveFailed,
 	string(ReasonCredentialsCreated):          ReasonCredentialsCreated,

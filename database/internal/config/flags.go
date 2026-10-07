@@ -75,6 +75,9 @@ func bindFlags(set *flag.FlagSet, defaults Config) {
 		defaults.Observability.Monitoring.ScrapeInterval,
 		"Prometheus ServiceMonitor scrape interval.")
 
+	set.Bool("security.rejectVMPassword", defaults.Security.RejectVMPassword,
+		"Reject new DBInstances that set spec.vmPassword (password login to the VM). Existing instances are unaffected.")
+
 	set.Bool("logging.development", defaults.Logging.Development,
 		"Enable development logging.")
 	set.String("logging.encoder", defaults.Logging.Encoder,

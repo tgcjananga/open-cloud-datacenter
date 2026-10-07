@@ -33,6 +33,7 @@ type Config struct {
 	Infrastructure   InfrastructureConfig                 `konf:"infrastructure"`
 	DatabaseDefaults DatabaseDefaults                     `konf:"databaseDefaults"`
 	Observability    ObservabilityConfig                  `konf:"observability"`
+	Security         SecurityConfig                       `konf:"security"`
 	Logging          LoggingConfig                        `konf:"logging"`
 	InstanceClasses  map[string]dbaasv1.InstanceClassSpec `konf:"instanceClasses"`
 }
@@ -98,6 +99,18 @@ type DatabaseDefaults struct {
 	Port           int    `konf:"port"`
 	// OSVersion is the internal/catalog stream key (e.g. "24.04"); platform-wide, with no per-instance override.
 	OSVersion string `konf:"osVersion"`
+}
+
+// SecurityConfig holds platform-wide policy switches that tighten what a
+// DBInstance may ask for. Every switch defaults to off, so enabling one is an
+// explicit operator decision.
+type SecurityConfig struct {
+	// RejectVMPassword makes a new DBInstance with a non-empty spec.vmPassword
+	// fail preflight. vmPassword turns on password login (console and SSH) for
+	// the VM's OS user, which production platforms normally do not want.
+	// Instances whose VM already exists are not affected: vmPassword is
+	// immutable, so they keep what they were created with.
+	RejectVMPassword bool `konf:"rejectVMPassword"`
 }
 
 type ObservabilityConfig struct {

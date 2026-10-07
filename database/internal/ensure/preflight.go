@@ -48,6 +48,20 @@ func (*preflightStep) Name() string { return "preflight" }
 
 // NAD existence is not yet verified (no NAD type in the manager scheme); RBAC for
 // get/list is already in place, so the check can be added once the scheme is.
+// vmPasswordRejectedMessage never echoes the value.
+const vmPasswordRejectedMessage = "spec.vmPassword is set, but this platform does not allow password login to the VM " +
+	"(security.rejectVMPassword). Remove spec.vmPassword and recreate the DBInstance"
+
+// vmPasswordRejected reports whether spec.vmPassword must be refused for this
+// instance: the platform policy is on, a value is set, and the VM has never been
+// created (AppliedSpec == nil, the same "never provisioned" test the OS-image
+// checks below use). An instance whose VM already exists keeps the value it was
+// created with — vmPassword is immutable, so there is nothing to change, and a
+// repave or an out-of-band VM rebuild must keep reproducing the same VM.
+func (d Dependencies) vmPasswordRejected(inst *dbaasv1.DBInstance) bool {
+	return d.Security.RejectVMPassword && inst.Spec.VMPassword != "" && inst.Status.AppliedSpec == nil
+}
+
 func (r *preflightStep) Run(ctx context.Context, inst *dbaasv1.DBInstance) Result {
 	if _, ok := r.instanceClasses()[inst.Spec.DBInstanceClass]; !ok {
 		msg := fmt.Sprintf("unknown dbInstanceClass %q", inst.Spec.DBInstanceClass)
@@ -60,6 +74,12 @@ func (r *preflightStep) Run(ctx context.Context, inst *dbaasv1.DBInstance) Resul
 		msg := "spec.networkRef is required (namespace/nad of an existing Multus NetworkAttachmentDefinition)"
 		inst.SetCurrentCondition(dbaasv1.ConditionPreflightReady, metav1.ConditionFalse, dbaasv1.ReasonNetworkRefMissing, msg)
 		return Terminal(dbaasv1.ReasonNetworkRefMissing, msg)
+	}
+
+	if r.vmPasswordRejected(inst) {
+		inst.SetCurrentCondition(dbaasv1.ConditionPreflightReady, metav1.ConditionFalse,
+			dbaasv1.ReasonVMPasswordNotAllowed, vmPasswordRejectedMessage)
+		return Terminal(dbaasv1.ReasonVMPasswordNotAllowed, vmPasswordRejectedMessage)
 	}
 
 	// Reject immutable edits first so a networkRef/dbName/etc. change is

@@ -77,6 +77,7 @@ func testEnsureDependencies(r *DBInstanceReconciler) ensure.Dependencies {
 		Recorder:          r.Recorder,
 		GrafanaBaseURL:    r.GrafanaBaseURL,
 		OperatorNamespace: operatorNamespace,
+		Security:          r.Security,
 	}
 }
 

@@ -152,6 +152,7 @@ func main() {
 		DatabaseDefaults:        cfg.DatabaseDefaults,
 		InstanceClasses:         cfg.InstanceClasses,
 		Monitoring:              cfg.Observability.Monitoring,
+		Security:                cfg.Security,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "dbinstance")
 		os.Exit(1)

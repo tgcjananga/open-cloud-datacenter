@@ -69,6 +69,7 @@ type DBInstanceReconciler struct {
 	DatabaseDefaults operatorconfig.DatabaseDefaults
 	InstanceClasses  map[string]dbaasv1.InstanceClassSpec
 	Monitoring       operatorconfig.MonitoringConfig
+	Security         operatorconfig.SecurityConfig
 }
 
 // DBInstance CRD permissions.
@@ -280,6 +281,7 @@ func (r *DBInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			DatabaseDefaults:  r.DatabaseDefaults,
 			InstanceClasses:   r.InstanceClasses,
 			Monitoring:        r.Monitoring,
+			Security:          r.Security,
 		})
 	}
 

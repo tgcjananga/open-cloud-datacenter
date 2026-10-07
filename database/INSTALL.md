@@ -1,6 +1,6 @@
 # Installing DBaaS via Helm chart + Harvester Addon
 
-> **Owner:** DBaaS operator maintainers · **Last updated:** 2026-09-28 · **Status:** experimental (repo-registered Addon)
+> **Owner:** DBaaS operator maintainers · **Last updated:** 2026-10-07 · **Status:** experimental (repo-registered Addon)
 > **Related:** [Discussion #303](https://github.com/wso2/open-cloud-datacenter/discussions/303) (release-process RFC — scope, GHCR namespace, versioning policy) · `database/charts/chart/` (chart source) · `.github/workflows/database-test-chart.yaml` (CI)
 >
 > Found something here wrong, stale, or missing? Raise it on [Discussion #303](https://github.com/wso2/open-cloud-datacenter/discussions/303) rather than silently working around it.
@@ -41,7 +41,8 @@ kubebuilder edit --plugins=helm/v2-alpha --output-dir=charts
 ## 2. Fix the generated defaults (one-time per real change, not every regen)
 
 - **`Chart.yaml`** is never auto-regenerated — set `name`/`description`/`version`/`appVersion` by hand. Keep the chart name consistent with `HELM_RELEASE` in `make helm-deploy`, or you get a double-barrelled `<release>-<chart>` resource prefix instead of a clean one.
-- **`rbac.namespaced` toggle**: the plugin generates this on `manager-role.yaml`/`manager-rolebinding.yaml`/the three `dbinstance-*-role.yaml` files. **Remove it** — DBaaS reconciles `DBInstance`s across every tenant namespace, so a namespaced `Role` would silently blind the manager outside its own install namespace. Hardcode `ClusterRole`/`ClusterRoleBinding` in all five, drop `namespaced:` from `values.yaml`. Doesn't survive a bare regen — reapply after any template-affecting change.
+- **`rbac.namespaced` toggle**: the plugin generates this on `manager-role.yaml`/`manager-rolebinding.yaml`/the three `dbinstance-*-role.yaml` files. **Remove it** — DBaaS reconciles `DBInstance`s across every tenant namespace, and the manager lists and watches cluster-wide (`cmd/main.go` sets no cache namespace), so with only a namespaced `Role` it hits `forbidden` errors and cannot start reconciling. Hardcode `ClusterRole`/`ClusterRoleBinding` in all five, drop `namespaced:` from `values.yaml`. Doesn't survive a bare regen — reapply after any template-affecting change.
+  - **A single-namespace install (controller and `DBInstance`s in one namespace) is therefore not supported yet.** Supporting it needs two things together: the chart toggle, and an operator setting that restricts the manager's cache to the watched namespace (plus read access to the image and NAD namespaces). It would also put the controller-private Secrets (internal credentials, TLS keys) in the tenants' namespace, so it would suit testing only.
 - **Image default**: point `values.yaml`'s `manager.image.repository`/`tag` at your real publish target — never the generic `controller`/`latest` placeholder, never a personal registry (see above).
 
 ## 3. Package the chart
@@ -109,6 +110,8 @@ spec:
 ```
 `repo` is schema-required but `helm repo add` (which the install job only runs when `repo` is non-empty) doesn't understand `oci://` — an explicit empty string satisfies the schema without breaking the OCI pull, which happens entirely through `chart`.
 
+`valuesContent: {}` installs the chart defaults. **For a production install, set it as shown in [Production hardening](#production-hardening-reject-vm-password-login) instead.**
+
 ```sh
 kubectl apply -f dbaas-operator-addon.yaml
 ```
@@ -150,6 +153,26 @@ Not `Available`? `kubectl describe dbinstance dbaas-test-01 -n default` — the 
 
 **Definition of done:** `Addon` status `AddonDeploySuccessful` **+** manager pod `Running` with the expected image **+** a test `DBInstance` reaching `Available`. All three — a healthy `Addon` status alone doesn't prove a database can provision.
 
+## Production hardening: reject VM password login
+
+`spec.vmPassword` gives a VM console/SSH password login and is meant for development only. The operator setting `security.rejectVMPassword` (flag `--security.rejectVMPassword=true`) refuses it. **It defaults to off, so production installs should turn it on.**
+
+- **When on:** a *new* `DBInstance` that sets `spec.vmPassword` is rejected (`Accepted=False`, reason `VMPasswordNotAllowed`, phase `incompatible-parameters`) and nothing is created. Instances whose VM already exists are never affected.
+- **Enable it** through the Addon's `valuesContent` (step 8):
+
+  ```yaml
+    valuesContent: |-
+      manager:
+        args:
+          - --operator.leaderElection.enabled=true
+          - --observability.metrics.bindAddress=:8443
+          - --security.rejectVMPassword=true
+  ```
+
+  A list override **replaces** the default `manager.args`, it does not merge. Repeat every flag from `values.yaml` (the first two are today's defaults), or leader election and metrics are silently lost. The kustomize path sets `"security": {"rejectVMPassword": true}` in the operator config instead; `DBAAS_SECURITY__REJECT_VM_PASSWORD=true` also works.
+- **Check it is active:** `kubectl get deployment dbaas-operator-controller-manager -n dbaas-system -o jsonpath='{.spec.template.spec.containers[0].args}'` must list the flag.
+- **Good to know:** new instances then have no console or SSH login through the operator (no password, no injected key). `vmPassword` is immutable, so an existing instance can only drop it by being recreated; take a `pg_dump` first.
+
 ## Upgrading an already-installed Addon
 
 A version bump does **not** need disable/re-enable — Harvester's controller reacts to a `spec.version` change with a real `helm upgrade --install` in place, leaving CRDs and existing `DBInstance`s untouched.
@@ -188,4 +211,5 @@ Once WSO2 registry access exists:
 | --- | --- | --- |
 | `spec.repo: Required value` | Harvester's CRD schema requires the `repo` key present | Set `repo: ""` explicitly (step 8) |
 | `DBInstance` phase `incompatible-parameters` immediately | `Accepted=False` from `preflight.go` — check `.status.conditions` | Usually `OSImageNotFound`/`OSImageInvalid` (step 7), not a manifest problem |
+| `DBInstance` phase `incompatible-parameters`, `Accepted` reason `VMPasswordNotAllowed` | The operator runs with `security.rejectVMPassword=true` and the manifest sets `spec.vmPassword` | Remove `spec.vmPassword` and recreate the `DBInstance`; or, on a dev install only, turn the setting off (see [Production hardening](#production-hardening-reject-vm-password-login)) |
 | UI image upload times out at 60s with a Longhorn datasource error | Rancher's proxying load balancer has an upload size cap (~700MB) | Upload directly against Harvester, bypassing the proxy |

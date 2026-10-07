@@ -305,3 +305,92 @@ func TestPasswordSecretTypeIsOnlyAGuardrail(t *testing.T) {
 		t.Fatal("expected the forged Secret's value to be returned")
 	}
 }
+
+// Teardown deletes pg-<name>-credentials, -connect and -cloudinit by name, so a
+// user's Secret carrying one of those names would be deleted with the
+// instance. The name is therefore refused before anything is read.
+func TestResolvePasswordSourceRefusesTheNamesOfSecretsDBaaSOwns(t *testing.T) {
+	for _, owned := range []string{"pg-orders-credentials", "pg-orders-connect", "pg-orders-cloudinit"} {
+		t.Run(owned, func(t *testing.T) {
+			// The Secret exists and would otherwise be valid, so only the name can reject it.
+			sec := byoSecret("tenant-a", owned, dbaasv1.PasswordSecretType,
+				map[string][]byte{"password": []byte("long-enough-password")})
+			reads := 0
+			r := resolverWith(t, sec)
+			watch, ok := r.Client.(client.WithWatch)
+			if !ok {
+				t.Fatal("fake client does not implement client.WithWatch")
+			}
+			r.Client = interceptor.NewClient(watch, interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					reads++
+					return c.Get(ctx, key, obj, opts...)
+				},
+			})
+
+			_, err := r.ResolvePasswordSource(context.Background(), byoInst(owned, "password"))
+
+			if !errors.Is(err, ErrPasswordSourceInvalid) || !strings.Contains(err.Error(), "reserved") {
+				t.Fatalf("err = %v, want ErrPasswordSourceInvalid mentioning a reserved name", err)
+			}
+			if reads != 0 {
+				t.Fatalf("the Secret was read %d times; a reserved name must be refused before any read", reads)
+			}
+		})
+	}
+}
+
+func TestResolvePasswordSourceAcceptsNamesThatOnlyLookSimilar(t *testing.T) {
+	for _, name := range []string{"orders-pw", "pg-orders-credentials-backup", "my-pg-orders-credentials", "pg-orders-password"} {
+		sec := byoSecret("tenant-a", name, dbaasv1.PasswordSecretType,
+			map[string][]byte{"password": []byte("long-enough-password")})
+		if _, err := resolverWith(t, sec).ResolvePasswordSource(context.Background(), byoInst(name, "password")); err != nil {
+			t.Errorf("name %q rejected: %v", name, err)
+		}
+	}
+}
+
+// Resolve must not create anything for a colliding name either.
+func TestResolveBYOWithAnOwnedSecretNameCreatesNothing(t *testing.T) {
+	inst := byoInst("pg-orders-credentials", "password")
+	sec := byoSecret("tenant-a", "pg-orders-credentials", dbaasv1.PasswordSecretType,
+		map[string][]byte{"password": []byte("long-enough-password")})
+	r := resolverWith(t, sec)
+
+	_, err := r.Resolve(context.Background(), inst)
+
+	if !errors.Is(err, ErrPasswordSourceInvalid) {
+		t.Fatalf("err = %v, want ErrPasswordSourceInvalid", err)
+	}
+	for _, key := range [][2]string{{"dbaas-system", InternalSecretName(inst)}, {"dbaas-system", TLSSecretName(inst)}} {
+		if _, ok := getSecret(t, r, key[0], key[1]); ok {
+			t.Errorf("Secret %s/%s was created", key[0], key[1])
+		}
+	}
+	// The user's Secret is exactly as it was: not adopted, not annotated, not owned.
+	got, _ := getSecret(t, r, "tenant-a", "pg-orders-credentials")
+	if len(got.Annotations) != 0 || len(got.OwnerReferences) != 0 || string(got.Data["password"]) != "long-enough-password" {
+		t.Fatalf("the user's Secret was touched: %+v", got)
+	}
+}
+
+// The harmful variant of the name clash: the user's Secret at the owned name
+// happens to carry admin_user and admin_password. Resolve must not adopt it as
+// DBaaS's own saved copy (it would then be deleted with the instance).
+func TestResolveBYOWithAnOwnedSecretNameDoesNotAdoptTheUsersSecret(t *testing.T) {
+	inst := byoInst("pg-orders-credentials", "password")
+	users := byoSecret("tenant-a", "pg-orders-credentials", dbaasv1.PasswordSecretType, map[string][]byte{
+		"password": []byte("long-enough-password"), "admin_user": []byte("dbadmin"), "admin_password": []byte("also-long-enough"),
+	})
+	r := resolverWith(t, users)
+
+	result, err := r.Resolve(context.Background(), inst)
+
+	if !errors.Is(err, ErrPasswordSourceInvalid) {
+		t.Fatalf("Resolve = (%+v, %v), want ErrPasswordSourceInvalid and no adoption", result.Source, err)
+	}
+	got, _ := getSecret(t, r, "tenant-a", "pg-orders-credentials")
+	if len(got.Annotations) != 0 || len(got.OwnerReferences) != 0 {
+		t.Fatalf("the user's Secret was adopted: annotations %v owners %v", got.Annotations, got.OwnerReferences)
+	}
+}

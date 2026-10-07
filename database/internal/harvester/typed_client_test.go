@@ -787,6 +787,54 @@ func TestTypedTeardownDeletesConnectionSecretAndIgnoresNotFound(t *testing.T) {
 	}
 }
 
+// Teardown deletes only the Secrets named in the instance's recorded refs. A
+// user-provided password Secret is not one of them, so it survives, along with
+// any other Secret in the namespace.
+func TestTypedTeardownNeverDeletesAUserProvidedPasswordSecret(t *testing.T) {
+	ctx := context.Background()
+	client := newTestTypedClient()
+	secrets := client.KubeClient.CoreV1().Secrets("tenant-a")
+	for _, name := range []string{
+		"pg-orders-credentials", "pg-orders-connect", "pg-orders-cloudinit", // DBaaS-owned: must go
+		"orders-pw",                         // the user's password Secret: must stay
+		"pg-other-credentials", "unrelated", // other objects: must stay
+	} {
+		if _, err := secrets.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "tenant-a"},
+			Type:       corev1.SecretType(dbaasv1.PasswordSecretType),
+			Data:       map[string][]byte{"password": []byte("user-chosen-password")},
+		}, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+	}
+
+	err := client.TeardownAll(ctx, "orders", "tenant-a", dbaasv1.ResourceRefs{
+		VMName:                     "pg-orders",
+		AdminCredentialsSecretName: "pg-orders-credentials",
+		ConnectionSecretName:       "pg-orders-connect",
+		CloudInitSecretName:        "pg-orders-cloudinit",
+	})
+	if err != nil {
+		t.Fatalf("TeardownAll: %v", err)
+	}
+
+	for _, gone := range []string{"pg-orders-credentials", "pg-orders-connect", "pg-orders-cloudinit"} {
+		if _, err := secrets.Get(ctx, gone, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			t.Errorf("DBaaS-owned Secret %s still exists: %v", gone, err)
+		}
+	}
+	for _, kept := range []string{"orders-pw", "pg-other-credentials", "unrelated"} {
+		got, err := secrets.Get(ctx, kept, metav1.GetOptions{})
+		if err != nil {
+			t.Errorf("Secret %s was deleted by teardown: %v", kept, err)
+			continue
+		}
+		if string(got.Data["password"]) != "user-chosen-password" {
+			t.Errorf("Secret %s was modified", kept)
+		}
+	}
+}
+
 func TestTypedTeardownAggregatesDeleteErrors(t *testing.T) {
 	ctx := context.Background()
 	client := newTestTypedClient(&kubevirtv1.VirtualMachine{

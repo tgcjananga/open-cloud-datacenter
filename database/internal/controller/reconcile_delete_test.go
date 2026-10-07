@@ -360,3 +360,71 @@ func TestRemoveDBInstanceFinalizerRetriesConflictAndPreservesConcurrentMetadata(
 		t.Fatalf("concurrent annotation = %q, want preserved", got.Annotations["concurrent"])
 	}
 }
+
+func newDeletingBYOInst() *dbaasv1.DBInstance {
+	inst := newDeletingInst()
+	inst.Spec.Credentials = &dbaasv1.CredentialsSpec{
+		PasswordSource: dbaasv1.PasswordSource{SecretRef: dbaasv1.PasswordSecretRef{Name: "orders-pw", Key: "password"}},
+	}
+	inst.Status.Credentials = &dbaasv1.CredentialsStatus{
+		Source:           dbaasv1.CredentialsSourceUserProvidedSecret,
+		SourceSecretName: "orders-pw",
+		SourceUID:        "src-uid",
+	}
+	inst.Status.Resources.InternalSecretRef = "dbaas-system/" + credentials.InternalSecretName(inst)
+	inst.Status.Resources.PrivateTLSSecretRef = "dbaas-system/" + credentials.TLSSecretName(inst)
+	return inst
+}
+
+// Deleting a BYO instance removes the platform Secrets and leaves the user's
+// own Secret exactly as it was, whether or not the instance's own status still
+// remembers where the password came from.
+func TestReconcileDeleteLeavesTheUserProvidedPasswordSecretAlone(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		forget bool // wipe the recorded refs so only the UID sweep runs
+	}{
+		{"by recorded refs", false},
+		{"by UID sweep when refs were lost", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			inst := newDeletingBYOInst()
+			if tc.forget {
+				inst.Status.Resources.InternalSecretRef = ""
+				inst.Status.Resources.PrivateTLSSecretRef = ""
+			}
+			internal := operatorSecret(credentials.InternalSecretName(inst), true)
+			tls := operatorSecret(credentials.TLSSecretName(inst), true)
+			source := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "tenant-a", Name: "orders-pw", UID: "src-uid"},
+				Type:       dbaasv1.PasswordSecretType,
+				Data:       map[string][]byte{"password": []byte("user-chosen-password")},
+			}
+			// A same-named Secret in the operator namespace belongs to nobody
+			// here: it has no UID label, so the sweep must not take it.
+			stray := operatorSecret("orders-pw", false)
+			r := newProvisionReconciler(t, &stubHarvester{}, inst, internal, tls, source, stray)
+
+			if _, err := runReconcileDelete(ctx, r, inst); err != nil {
+				t.Fatalf("reconcileDelete: %v", err)
+			}
+
+			for _, name := range []string{credentials.InternalSecretName(inst), credentials.TLSSecretName(inst)} {
+				if err := r.Get(ctx, types.NamespacedName{Namespace: "dbaas-system", Name: name}, &corev1.Secret{}); err == nil {
+					t.Errorf("platform Secret %s still exists", name)
+				}
+			}
+			var kept corev1.Secret
+			if err := r.Get(ctx, types.NamespacedName{Namespace: "tenant-a", Name: "orders-pw"}, &kept); err != nil {
+				t.Fatalf("the user's password Secret was deleted: %v", err)
+			}
+			if string(kept.Data["password"]) != "user-chosen-password" || len(kept.OwnerReferences) != 0 || len(kept.Finalizers) != 0 {
+				t.Fatalf("the user's password Secret was modified: %+v", kept)
+			}
+			if err := r.Get(ctx, types.NamespacedName{Namespace: "dbaas-system", Name: "orders-pw"}, &corev1.Secret{}); err != nil {
+				t.Fatalf("an unlabelled operator-namespace Secret was swept: %v", err)
+			}
+		})
+	}
+}

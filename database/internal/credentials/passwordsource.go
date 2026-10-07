@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	dbaasv1 "github.com/wso2/open-cloud-datacenter/crds/dbaas/api/v1alpha1"
+	"github.com/wso2/open-cloud-datacenter/crds/dbaas/internal/resource"
 )
 
 const (
@@ -132,6 +133,37 @@ func ValidatePassword(password string) error {
 	return nil
 }
 
+// ownedSecretNames are the Secrets DBaaS creates for an instance in the
+// instance's own namespace. All of them are deleted when the instance is.
+func ownedSecretNames(inst *dbaasv1.DBInstance) []string {
+	return []string{
+		TenantCredentialsSecretName(inst),
+		resource.ConnectionSecretName(inst),
+		resource.CloudInitSecretName(inst),
+	}
+}
+
+// checkSourceName refuses a password source named like a Secret DBaaS creates
+// for the instance. It needs no API access, so callers run it before anything
+// is read: an existing Secret with such a name would otherwise be mistaken for
+// DBaaS's own saved copy.
+func checkSourceName(inst *dbaasv1.DBInstance) error {
+	if inst.Spec.Credentials == nil {
+		return nil
+	}
+	ref := inst.Spec.Credentials.PasswordSource.SecretRef
+	for _, owned := range ownedSecretNames(inst) {
+		if ref.Name == owned {
+			return &PasswordSourceError{
+				Kind: ErrPasswordSourceInvalid, Namespace: inst.Namespace, Name: ref.Name, Key: ref.Key,
+				Detail: "name is reserved: DBaaS creates a Secret with this name for this instance and deletes it " +
+					"with the instance; use a different name for your password Secret",
+			}
+		}
+	}
+	return nil
+}
+
 // ResolvePasswordSource reads and validates the user-provided master password
 // named by spec.credentials.passwordSource.secretRef.
 //
@@ -139,6 +171,12 @@ func ValidatePassword(password string) error {
 // cross-namespace reference. Its type must be dbaasv1.PasswordSecretType — a
 // guardrail against mistakes, not isolation (see that constant). It does not
 // read, create or change any other object, and it never modifies the source.
+//
+// The source may not be named like a Secret DBaaS itself creates for this
+// instance (pg-<name>-credentials, -connect, -cloudinit). Teardown deletes
+// those by name, so a user's Secret with one of those names would be deleted
+// with the instance, and at creation DBaaS would mistake it for its own saved
+// copy. Rejecting the name keeps "DBaaS never deletes the user's Secret" true.
 //
 // Errors: *PasswordSourceError wrapping ErrPasswordSourceNotFound (retry) or
 // ErrPasswordSourceInvalid (permanent); any other error is a transient API
@@ -161,6 +199,10 @@ func (r *Resolver) ResolvePasswordSource(ctx context.Context, inst *dbaasv1.DBIn
 		return PasswordSourceResult{}, &PasswordSourceError{
 			Kind: kind, Namespace: inst.Namespace, Name: ref.Name, Key: ref.Key, Detail: detail,
 		}
+	}
+
+	if err := checkSourceName(inst); err != nil {
+		return PasswordSourceResult{}, err
 	}
 
 	var sec corev1.Secret

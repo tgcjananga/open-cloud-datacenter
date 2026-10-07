@@ -862,3 +862,27 @@ func TestEnsureCredentialsGeneratedInstanceNeverChecksASource(t *testing.T) {
 		t.Fatalf("a generated instance read %d other Secrets / SourceChanged=%t", reads, inst.Status.Credentials.SourceChanged)
 	}
 }
+
+func TestEnsureCredentialsSourceNamedLikeAnOwnedSecretIsInvalid(t *testing.T) {
+	ctx := context.Background()
+	inst := byoProvisionInst()
+	inst.Spec.Credentials.PasswordSource.SecretRef.Name = "pg-orders-credentials"
+	clash := byoSourceSecret()
+	clash.Name = "pg-orders-credentials"
+	r := newTestHarness(t, &stubHarvester{}, inst, clash)
+
+	res := r.ensureCredentials(ctx, inst)
+
+	if res.Outcome != OutcomePending || res.Reason != dbaasv1.ReasonPasswordSourceInvalid {
+		t.Fatalf("result = %+v, want Pending/PasswordSourceInvalid", res)
+	}
+	cond := inst.Status.GetCondition(dbaasv1.ConditionCredentialsReady)
+	if cond == nil || !strings.Contains(cond.Message, "reserved") {
+		t.Fatalf("CredentialsReady = %+v, want a message saying the name is reserved", cond)
+	}
+	for _, key := range secretKeys(inst)[1:] { // internal and TLS must not exist
+		if secretExists(r, key) {
+			t.Errorf("Secret %s was created", key)
+		}
+	}
+}

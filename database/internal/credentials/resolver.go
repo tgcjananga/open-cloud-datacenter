@@ -186,6 +186,12 @@ func (r *Resolver) Resolve(ctx context.Context, inst *dbaasv1.DBInstance) (Resol
 // at creation, and never again. Editing or deleting it afterwards cannot make a
 // retry or a repave use a different password than the database was given.
 func (r *Resolver) getOrCreateTenant(ctx context.Context, inst *dbaasv1.DBInstance) (tenantCredentials, bool, error) {
+	// Before anything is read: a user's Secret named like our own saved copy
+	// would be found below and adopted as if DBaaS had created it.
+	if err := checkSourceName(inst); err != nil {
+		return tenantCredentials{}, false, err
+	}
+
 	key := types.NamespacedName{Namespace: inst.Namespace, Name: TenantCredentialsSecretName(inst)}
 	var sec corev1.Secret
 	if getErr := r.Client.Get(ctx, key, &sec); getErr == nil {

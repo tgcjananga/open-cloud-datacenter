@@ -271,6 +271,13 @@ type PasswordSecretRef struct {
 	Key string `json:"key"`
 }
 
+// PasswordSecretType is the Secret type a user-provided master-password
+// Secret must have. It is a guardrail against pointing a DBInstance at an
+// unrelated Secret (a TLS key, a service-account token) by mistake. It is NOT
+// access control: anyone allowed to create or update a Secret can set its
+// type. Who may be referenced is decided by RBAC.
+const PasswordSecretType = "dbaas.opencloud.wso2.com/master-password"
+
 // CredentialsSource values for CredentialsStatus.Source.
 const (
 	// CredentialsSourceGenerated means the controller generated the password.

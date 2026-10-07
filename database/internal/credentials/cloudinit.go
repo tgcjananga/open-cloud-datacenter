@@ -282,25 +282,82 @@ ssh_pwauth: true
 
       systemctl restart postgresql
 
+      # BEGIN role-setup
       # Create admin user and database. The master user gets CREATEDB and
       # CREATEROLE so it can manage its own databases / roles, but NOT
       # SUPERUSER — RDS-style master users shouldn't be able to bypass
       # the engine's permission system. Database ownership is sufficient
       # for all in-database operations (DDL, GRANT, etc.).
-      sudo -u postgres psql -p "${DB_PORT}" <<EOSQL
-      DO \$\$
-      BEGIN
-        IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${MASTER_USER}') THEN
-          CREATE ROLE "${MASTER_USER}" LOGIN CREATEDB CREATEROLE PASSWORD '${MASTER_PASSWORD}';
-        END IF;
-        IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'postgres_exporter') THEN
-          CREATE ROLE postgres_exporter LOGIN PASSWORD '${EXPORTER_PASSWORD}';
-        END IF;
-      END \$\$;
-      GRANT pg_monitor TO postgres_exporter;
-      SELECT 'CREATE DATABASE "${DB_NAME}" OWNER "${MASTER_USER}"'
-        WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${DB_NAME}')\gexec
+      #
+      # Passwords reach psql through 0600 files in a postgres-owned tmpfs
+      # directory (read server-side with pg_read_file), never through argv
+      # or the environment, and every dynamic identifier/value is built with
+      # format(%%I / %%L) so no byte of it is ever parsed as shell or SQL.
+      SECRET_DIR="$(mktemp -d /run/dbaas-bootstrap.XXXXXX)"
+      PGPASS_FILE=""
+      cleanup_secrets() {
+        rm -rf "${SECRET_DIR}"
+        if [ -n "${PGPASS_FILE}" ]; then shred -u "${PGPASS_FILE}" 2>/dev/null || rm -f "${PGPASS_FILE}"; fi
+      }
+      trap cleanup_secrets EXIT
+      chown postgres:postgres "${SECRET_DIR}"
+      chmod 0700 "${SECRET_DIR}"
+      write_secret() {
+        ( umask 077; printf '%%s' "$2" > "${SECRET_DIR}/$1" )
+        chown postgres:postgres "${SECRET_DIR}/$1"
+      }
+      write_secret master_pw "${MASTER_PASSWORD}"
+      write_secret exporter_pw "${EXPORTER_PASSWORD}"
+
+      # Did the master role already exist? On a repave that keeps PGDATA it
+      # does, and its password may legitimately differ from the snapshot.
+      ROLE_EXISTED="$(sudo -u postgres psql -X -qAt -p "${DB_PORT}" \
+        -v ON_ERROR_STOP=1 -v master_user="${MASTER_USER}" <<'EOSQL'
+      SELECT 1 FROM pg_roles WHERE rolname = :'master_user'
       EOSQL
+      )"
+
+      # ON_ERROR_STOP makes psql exit non-zero on any SQL error, including
+      # inside \gexec, so set -e aborts before the completion marker.
+      # log_min_error_statement stops a failed CREATE ROLE from writing the
+      # statement (and the password in it) to the server log.
+      sudo -u postgres psql -X -q -p "${DB_PORT}" -v ON_ERROR_STOP=1 \
+        -v master_user="${MASTER_USER}" -v db_name="${DB_NAME}" \
+        -v secret_dir="${SECRET_DIR}" <<'EOSQL'
+      SET log_min_error_statement = panic;
+      SELECT pg_read_file(:'secret_dir' || '/master_pw') AS master_pw \gset
+      SELECT pg_read_file(:'secret_dir' || '/exporter_pw') AS exporter_pw \gset
+      SELECT format('CREATE ROLE %%I LOGIN CREATEDB CREATEROLE PASSWORD %%L', :'master_user', :'master_pw')
+        WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'master_user') \gexec
+      SELECT format('CREATE ROLE postgres_exporter LOGIN PASSWORD %%L', :'exporter_pw')
+        WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'postgres_exporter') \gexec
+      GRANT pg_monitor TO postgres_exporter;
+      SELECT format('CREATE DATABASE %%I OWNER %%I', :'db_name', :'master_user')
+        WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = :'db_name') \gexec
+      EOSQL
+
+      # Prove the password actually works before readiness can go true: a
+      # fresh TCP+SSL password login (the hostssl rule only allows
+      # scram-sha-256), with the password in a temporary 0600 PGPASSFILE.
+      # .pgpass escapes ':' and '\' with a backslash. Only checked when this
+      # run created the role: an existing role (repave keeping PGDATA) may
+      # have had its password changed since, which is not a failure here.
+      if [ -z "${ROLE_EXISTED}" ]; then
+        pgpass_escape() { printf '%%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g'; }
+        PGPASS_FILE="$(mktemp /run/dbaas-pgpass.XXXXXX)"
+        printf '%%s:%%s:%%s:%%s:%%s\n' 127.0.0.1 "${DB_PORT}" \
+          "$(pgpass_escape "${DB_NAME}")" "$(pgpass_escape "${MASTER_USER}")" \
+          "$(pgpass_escape "${MASTER_PASSWORD}")" > "${PGPASS_FILE}"
+        if ! PGPASSFILE="${PGPASS_FILE}" PGSSLMODE=require psql -X -w -qAt \
+            -h 127.0.0.1 -p "${DB_PORT}" -U "${MASTER_USER}" -d "${DB_NAME}" \
+            -c 'SELECT 1' >/dev/null 2>&1; then
+          echo "ERROR: password login as ${MASTER_USER} failed after role creation" >&2
+          exit 1
+        fi
+      fi
+      cleanup_secrets
+      trap - EXIT
+      # END role-setup
 
       # Bootstrap-completion marker, checked by the KubeVirt readiness probe
       # (internal/harvester/typed_client.go). pg_isready alone answers "is a
@@ -345,13 +402,13 @@ runcmd:
 final_message: "DBaaS bootstrap complete for %s"
 `,
 		vmUserBlock,
-		p.ID,
-		p.DBName,
+		shellSingleQuote(p.ID),
+		shellSingleQuote(p.DBName),
 		p.Port,
-		p.MasterUser,
-		m.AdminPassword,
-		m.ReplPassword,
-		m.ExporterPassword,
+		shellSingleQuote(p.MasterUser),
+		shellSingleQuote(m.AdminPassword),
+		shellSingleQuote(m.ReplPassword),
+		shellSingleQuote(m.ExporterPassword),
 		p.MaxConnections,
 		shellSingleQuote(p.EngineVersion),
 		backupConfig,

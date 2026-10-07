@@ -18,6 +18,7 @@ package credentials
 
 import (
 	"encoding/base64"
+	"os"
 	"strings"
 	"testing"
 
@@ -54,13 +55,13 @@ func TestBuildCloudInitEmbedsBootstrapAndTLSMaterial(t *testing.T) {
 	userdata, _ := BuildCloudInit(testBootstrapParams(), testMaterial())
 
 	for _, want := range []string{
-		"INSTANCE_ID=orders",
-		"DB_NAME=orders",
+		"INSTANCE_ID='orders'",
+		"DB_NAME='orders'",
 		"DB_PORT=5432",
-		"MASTER_USER=dbadmin",
-		"MASTER_PASSWORD=admin-pw",
-		"REPL_PASSWORD=repl-pw",
-		"EXPORTER_PASSWORD=exporter-pw",
+		"MASTER_USER='dbadmin'",
+		"MASTER_PASSWORD='admin-pw'",
+		"REPL_PASSWORD='repl-pw'",
+		"EXPORTER_PASSWORD='exporter-pw'",
 		"MAX_CONNECTIONS=100",
 		`hostssl all all 0.0.0.0/0 scram-sha-256`,
 		`hostssl replication all 0.0.0.0/0 scram-sha-256`,
@@ -163,7 +164,7 @@ func TestUserDataTouchesTheProbedBootstrapMarker(t *testing.T) {
 	// pg_isready passes, phase goes available, and the first client login
 	// fails with "password authentication failed" against a role PostgreSQL
 	// has not created yet.
-	sqlIdx := strings.Index(userdata, "CREATE ROLE \"${MASTER_USER}\"")
+	sqlIdx := strings.Index(userdata, "CREATE ROLE %I LOGIN CREATEDB CREATEROLE")
 	touchIdx := strings.Index(userdata, touch)
 	if sqlIdx == -1 {
 		t.Fatal("userdata missing the master-role CREATE ROLE statement")
@@ -248,5 +249,145 @@ func TestBuildCloudInitNetworkDataStatic(t *testing.T) {
 		if !strings.Contains(networkdata, want) {
 			t.Errorf("networkdata missing %q, got: %s", want, networkdata)
 		}
+	}
+}
+
+// nastyPasswords are passwords with every character that is special to
+// bash, SQL, YAML or .pgpass. A BYO password can contain any of them.
+var nastyPasswords = []string{
+	`it's"a$HOME\\path:x`,
+	"back`tick`s and $(subshell)",
+	`semi;colon && pipe | amp & hash #`,
+	`  leading and trailing spaces  `,
+	`colon:and\\backslash\\:mix`,
+	`%I %L %s %d`,
+	`EOSQL`,
+	`'; DROP ROLE postgres; --`,
+	`ünïcödé-密码-🔑`,
+}
+
+func renderBootstrapScript(t *testing.T, m *Material) string {
+	t.Helper()
+	userdata, _ := BuildCloudInit(testBootstrapParams(), m)
+	const marker = "  - path: /etc/dbaas/bootstrap.sh\n    permissions: \"0700\"\n    content: |\n"
+	i := strings.Index(userdata, marker)
+	if i == -1 {
+		t.Fatal("bootstrap.sh write_files entry not found")
+	}
+	body := userdata[i+len(marker):]
+	if j := strings.Index(body, "\nruncmd:"); j != -1 {
+		body = body[:j+1]
+	}
+	var out strings.Builder
+	for _, line := range strings.Split(strings.TrimSuffix(body, "\n"), "\n") {
+		out.WriteString(strings.TrimPrefix(line, "      "))
+		out.WriteString("\n")
+	}
+	return out.String()
+}
+
+func TestBuildCloudInitQuotesEverySecretInBootstrapEnv(t *testing.T) {
+	baseline := renderBootstrapScript(t, testMaterial())
+	for _, pw := range nastyPasswords {
+		m := testMaterial()
+		m.AdminPassword = pw
+		m.ExporterPassword = pw
+		userdata, _ := BuildCloudInit(testBootstrapParams(), m)
+		for _, key := range []string{"MASTER_PASSWORD=", "EXPORTER_PASSWORD="} {
+			if want := key + shellSingleQuote(pw); !strings.Contains(userdata, want) {
+				t.Errorf("password %q is not rendered as a single-quoted %s assignment", pw, key)
+			}
+		}
+		// The password lives only in bootstrap.env. The script text must be
+		// identical whatever the password is, so no byte of it can ever be
+		// parsed as shell or SQL.
+		if got := renderBootstrapScript(t, m); got != baseline {
+			t.Errorf("bootstrap.sh changes with the password %q; the password leaked into script text", pw)
+		}
+	}
+}
+
+func TestBootstrapScriptHardenedRoleSetup(t *testing.T) {
+	script := renderBootstrapScript(t, testMaterial())
+
+	for _, want := range []string{
+		"-v ON_ERROR_STOP=1",
+		"<<'EOSQL'", // quoted heredoc: the shell must not expand anything inside
+		"format('CREATE ROLE %I LOGIN CREATEDB CREATEROLE PASSWORD %L'",
+		"format('CREATE ROLE postgres_exporter LOGIN PASSWORD %L'",
+		"format('CREATE DATABASE %I OWNER %I'",
+		"pg_read_file(:'secret_dir'",
+		"PGPASSFILE=",
+		"set -euo pipefail",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("bootstrap script missing %q", want)
+		}
+	}
+
+	for _, banned := range []string{
+		"PASSWORD '${MASTER_PASSWORD}'", // the old unquoted interpolation
+		"PASSWORD '${EXPORTER_PASSWORD}'",
+		"PGPASSWORD",
+		"set -x",
+		`<<EOSQL`, // unquoted heredoc
+	} {
+		if strings.Contains(script, banned) {
+			t.Errorf("bootstrap script must not contain %q", banned)
+		}
+	}
+
+	// A password must never be placed on a command line: the only places
+	// ${MASTER_PASSWORD}/${EXPORTER_PASSWORD} may appear are the file writers.
+	for _, line := range strings.Split(script, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		for _, v := range []string{"${MASTER_PASSWORD}", "${EXPORTER_PASSWORD}"} {
+			if !strings.Contains(line, v) {
+				continue
+			}
+			ok := strings.HasPrefix(trimmed, "write_secret ") ||
+				strings.HasPrefix(trimmed, `"$(pgpass_escape "${MASTER_PASSWORD}")"`) ||
+				strings.HasPrefix(trimmed, "DATA_SOURCE_NAME=")
+			if !ok {
+				t.Errorf("unexpected use of %s: %q", v, trimmed)
+			}
+		}
+	}
+}
+
+// The verification login must run after the role exists and before the
+// readiness marker, and a failure must exit before the marker is written.
+func TestBootstrapScriptVerifiesLoginBeforeMarker(t *testing.T) {
+	script := renderBootstrapScript(t, testMaterial())
+
+	create := strings.Index(script, "CREATE ROLE %I LOGIN CREATEDB CREATEROLE")
+	verify := strings.Index(script, `-c 'SELECT 1'`)
+	fail := strings.Index(script, "password login as ${MASTER_USER} failed")
+	exit1 := strings.Index(script[fail:], "exit 1")
+	marker := strings.Index(script, "touch "+harvester.GuestBootstrapCompleteMarker)
+	if create == -1 || verify == -1 || fail == -1 || exit1 == -1 || marker == -1 {
+		t.Fatalf("missing piece: create=%d verify=%d fail=%d exit1=%d marker=%d", create, verify, fail, exit1, marker)
+	}
+	if !(create < verify && verify < fail && fail+exit1 < marker) {
+		t.Fatalf("wrong order: create=%d verify=%d fail=%d exit=%d marker=%d", create, verify, fail, fail+exit1, marker)
+	}
+	if !strings.Contains(script, `if [ -z "${ROLE_EXISTED}" ]`) {
+		t.Error("verification must run only when this boot created the role")
+	}
+}
+
+// DBAAS_DUMP_BOOTSTRAP=<path> writes the rendered bootstrap.sh so
+// test/byo-sql-quoting.sh can execute the real script text against a
+// throwaway PostgreSQL. It is a no-op in a normal `go test` run.
+func TestDumpBootstrapScript(t *testing.T) {
+	path := os.Getenv("DBAAS_DUMP_BOOTSTRAP")
+	if path == "" {
+		t.Skip("DBAAS_DUMP_BOOTSTRAP not set")
+	}
+	if err := os.WriteFile(path, []byte(renderBootstrapScript(t, testMaterial())), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }

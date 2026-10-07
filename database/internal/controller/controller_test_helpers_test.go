@@ -27,6 +27,7 @@ import (
 	dbaasv1 "github.com/wso2/open-cloud-datacenter/crds/dbaas/api/v1alpha1"
 	"github.com/wso2/open-cloud-datacenter/crds/dbaas/internal/catalog"
 	operatorconfig "github.com/wso2/open-cloud-datacenter/crds/dbaas/internal/config"
+	"github.com/wso2/open-cloud-datacenter/crds/dbaas/internal/credentials"
 	"github.com/wso2/open-cloud-datacenter/crds/dbaas/internal/ensure"
 	statuspatch "github.com/wso2/open-cloud-datacenter/crds/dbaas/internal/patch"
 	"github.com/wso2/open-cloud-datacenter/crds/dbaas/internal/testutil"
@@ -107,8 +108,18 @@ func convergeCredentials(t interface {
 	Fatalf(string, ...any)
 }, ctx context.Context, r *DBInstanceReconciler, inst *dbaasv1.DBInstance) {
 	t.Helper()
-	if result := runEnsureStep(ctx, r, inst, "credentials"); result.Outcome != ensure.OutcomePending {
-		t.Fatalf("credential create result = %+v, want Pending", result)
+	// Many fixtures start from an instance whose VM already exists, which a real
+	// instance only gets after its durable Secrets were created. Store them the
+	// way first-time provisioning does (without the "already provisioned" guard),
+	// then let the step observe them.
+	seed := &credentials.Resolver{
+		Client:            r.Client,
+		Scheme:            r.Client.Scheme(),
+		OperatorNamespace: testEnsureDependencies(r).OperatorNamespace,
+		DefaultMasterUser: operatorconfig.Default().DatabaseDefaults.MasterUsername,
+	}
+	if _, err := seed.Resolve(ctx, inst); err != nil {
+		t.Fatalf("seed durable credentials: %v", err)
 	}
 	if result := runEnsureStep(ctx, r, inst, "credentials"); result.Outcome != ensure.OutcomeSatisfied {
 		t.Fatalf("credential observe result = %+v, want Satisfied", result)

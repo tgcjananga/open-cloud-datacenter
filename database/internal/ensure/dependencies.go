@@ -46,6 +46,7 @@ func (d Dependencies) credentialsResolver() *credentials.Resolver {
 		Scheme:            d.Scheme(),
 		OperatorNamespace: d.OperatorNamespace,
 		DefaultMasterUser: d.databaseDefaults().MasterUsername,
+		Established:       d.instanceEstablished,
 	}
 }
 

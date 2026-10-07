@@ -18,6 +18,7 @@ package credentials
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
@@ -53,6 +54,12 @@ func TLSSecretName(inst *dbaasv1.DBInstance) string {
 // would diverge from the running instance.
 type Resolver struct {
 	Client client.Client
+	// Established reports whether the instance's VM has already been created.
+	// Once it has, a missing durable Secret is a loss to report, never
+	// something to regenerate: a new password, internal credential or CA would
+	// not match what the booted VM and its database already hold. Nil means
+	// "never established" (tests, tools that only ever provision).
+	Established func(ctx context.Context, inst *dbaasv1.DBInstance) (bool, error)
 	// Scheme is used to stamp a controller owner reference on the tenant
 	// credentials Secret (same-namespace). May be nil in tests that don't
 	// assert on owner refs.
@@ -62,6 +69,43 @@ type Resolver struct {
 	OperatorNamespace string
 	// DefaultMasterUser is used when spec.masterUsername is omitted.
 	DefaultMasterUser string
+}
+
+// ErrCredentialsLost: a durable credential Secret is missing for an instance
+// whose VM already exists. DBaaS refuses to regenerate it.
+var ErrCredentialsLost = errors.New("durable credential material is missing for an already-provisioned instance")
+
+// CredentialsLostError names the missing Secret. It never contains any secret
+// value.
+type CredentialsLostError struct {
+	Namespace string
+	Name      string
+}
+
+func (e *CredentialsLostError) Error() string {
+	return fmt.Sprintf("Secret %s/%s is missing, but this database has already been provisioned; "+
+		"DBaaS will not generate a replacement because it would not match the running database. "+
+		"Restore the Secret from a backup", e.Namespace, e.Name)
+}
+
+func (e *CredentialsLostError) Is(target error) bool { return target == ErrCredentialsLost }
+
+// refuseIfEstablished is called when a durable Secret is not found, before any
+// replacement is generated. It returns CredentialsLostError when the VM
+// already exists, and nil when this is genuine first-time provisioning (or a
+// partial create that never reached a booted VM).
+func (r *Resolver) refuseIfEstablished(ctx context.Context, inst *dbaasv1.DBInstance, key types.NamespacedName) error {
+	if r.Established == nil {
+		return nil
+	}
+	established, err := r.Established(ctx, inst)
+	if err != nil {
+		return fmt.Errorf("check whether %s/%s is already provisioned: %w", inst.Namespace, inst.Name, err)
+	}
+	if established {
+		return &CredentialsLostError{Namespace: key.Namespace, Name: key.Name}
+	}
+	return nil
 }
 
 // ResolveResult reports both the resolved material and whether this call
@@ -151,6 +195,10 @@ func (r *Resolver) getOrCreateTenant(ctx context.Context, inst *dbaasv1.DBInstan
 		return tenantCredentials{}, false, getErr
 	}
 
+	if err := r.refuseIfEstablished(ctx, inst, key); err != nil {
+		return tenantCredentials{}, false, err
+	}
+
 	adminUser := inst.Spec.MasterUsername
 	if adminUser == "" {
 		adminUser = r.DefaultMasterUser
@@ -231,6 +279,10 @@ func (r *Resolver) getOrCreateInternal(ctx context.Context, inst *dbaasv1.DBInst
 		return "", "", false, getErr //Transient Error
 	}
 
+	if err := r.refuseIfEstablished(ctx, inst, key); err != nil {
+		return "", "", false, err
+	}
+
 	replPw, err = randomString(32)
 	if err != nil {
 		return "", "", false, fmt.Errorf("generate replication password: %w", err)
@@ -276,6 +328,10 @@ func (r *Resolver) getOrCreateTLS(ctx context.Context, inst *dbaasv1.DBInstance,
 		return bundle, false, err
 	} else if !apierrors.IsNotFound(getErr) {
 		return nil, false, getErr
+	}
+
+	if err := r.refuseIfEstablished(ctx, inst, key); err != nil {
+		return nil, false, err
 	}
 
 	bundle, genErr := generateTLS(vmName)

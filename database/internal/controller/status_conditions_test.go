@@ -72,6 +72,32 @@ func TestFinalizeStatusAggregatesIntervention(t *testing.T) {
 	}
 }
 
+func TestFinalizeStatusFlagsInterventionOnlyForLostCredentials(t *testing.T) {
+	cases := []struct {
+		name   string
+		status metav1.ConditionStatus
+		reason dbaasv1.ConditionReason
+		want   bool
+	}{
+		{"credentials lost", metav1.ConditionFalse, dbaasv1.ReasonCredentialsLost, true},
+		{"source missing is the user's to fix, not an admin's", metav1.ConditionFalse, dbaasv1.ReasonPasswordSourceNotFound, false},
+		{"source invalid", metav1.ConditionFalse, dbaasv1.ReasonPasswordSourceInvalid, false},
+		{"credentials healthy", metav1.ConditionTrue, dbaasv1.ReasonCredentialsProvisioned, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			inst := newProvisionInst()
+			inst.SetCurrentCondition(dbaasv1.ConditionCredentialsReady, tc.status, tc.reason, "message")
+
+			(&DBInstanceReconciler{}).finalizeStatus(inst)
+
+			if got := inst.Status.IsConditionTrue(dbaasv1.ConditionInterventionRequired); got != tc.want {
+				t.Fatalf("InterventionRequired = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSyncRepaveInProgressClearsAfterSelfHealedDriftSettles(t *testing.T) {
 	inst := newProvisionInst()
 	inst.Generation = 3

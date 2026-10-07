@@ -70,6 +70,14 @@ func (r *DBInstanceReconciler) syncInterventionRequiredCondition(inst *dbaasv1.D
 			conditionMessage(inst, dbaasv1.ConditionCrashLoopHalted, "operator intervention required"))
 		return
 	}
+	// A durable credential Secret is missing for a provisioned database: nothing
+	// the controller can do, an admin has to restore it.
+	if c := inst.Status.GetCondition(dbaasv1.ConditionCredentialsReady); c != nil &&
+		c.Status == metav1.ConditionFalse && c.Reason == string(dbaasv1.ReasonCredentialsLost) {
+		inst.SetCurrentCondition(dbaasv1.ConditionInterventionRequired, metav1.ConditionTrue,
+			dbaasv1.ReasonInterventionRequired, c.Message)
+		return
+	}
 	inst.SetCurrentCondition(dbaasv1.ConditionInterventionRequired, metav1.ConditionFalse,
 		dbaasv1.ReasonNoInterventionRequired, "no operator intervention required")
 }

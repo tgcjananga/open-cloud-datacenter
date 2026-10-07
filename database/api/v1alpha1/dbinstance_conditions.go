@@ -83,6 +83,9 @@ const (
 	ReasonCredentialsResolveFailed    ConditionReason = "CredentialsResolveFailed"
 	ReasonCredentialsCreated          ConditionReason = "CredentialsCreated"
 	ReasonCredentialsProvisioned      ConditionReason = "CredentialsProvisioned"
+	ReasonCredentialsLost             ConditionReason = "CredentialsLost"
+	ReasonPasswordSourceNotFound      ConditionReason = "PasswordSourceNotFound"
+	ReasonPasswordSourceInvalid       ConditionReason = "PasswordSourceInvalid"
 	ReasonConnectionSecretReconciled  ConditionReason = "ConnectionSecretReconciled"
 	ReasonVMPresent                   ConditionReason = "VMPresent"
 	ReasonVMCreateFailed              ConditionReason = "VMCreateFailed"
@@ -152,6 +155,9 @@ var knownConditionReasons = map[string]ConditionReason{
 	string(ReasonCredentialsResolveFailed):    ReasonCredentialsResolveFailed,
 	string(ReasonCredentialsCreated):          ReasonCredentialsCreated,
 	string(ReasonCredentialsProvisioned):      ReasonCredentialsProvisioned,
+	string(ReasonCredentialsLost):             ReasonCredentialsLost,
+	string(ReasonPasswordSourceNotFound):      ReasonPasswordSourceNotFound,
+	string(ReasonPasswordSourceInvalid):       ReasonPasswordSourceInvalid,
 	string(ReasonConnectionSecretReconciled):  ReasonConnectionSecretReconciled,
 	string(ReasonVMPresent):                   ReasonVMPresent,
 	string(ReasonVMCreateFailed):              ReasonVMCreateFailed,

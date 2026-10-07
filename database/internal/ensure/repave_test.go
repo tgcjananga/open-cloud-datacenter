@@ -449,7 +449,7 @@ func TestEnsureRepaveTriggerWaitsForTeardown(t *testing.T) {
 
 func TestEnsureRepaveTriggerAppliesSwapWhenDown(t *testing.T) {
 	r, inst, stub := newRepaveFixture(t, kubevirtv1.RunStrategyHalted, harvester.VMIReadiness{})
-	convergeCredentials(t, context.Background(), r, inst) // regenerateCloudInit needs stable, already-resolved Material
+	seedDurableCredentials(t, context.Background(), r, inst) // regenerateCloudInit needs stable, already-resolved Material
 	triggerRepave(inst, "trigger-1")
 
 	res := r.ensureRepave(context.Background(), inst)
@@ -627,7 +627,7 @@ func TestEnsureRepaveRecoversPendingDeleteEvenWhenSelfHealObservationFails(t *te
 func TestEnsureRepaveContinuesAfterOwnPhaseChange(t *testing.T) {
 	ctx := context.Background()
 	r, inst, stub := newRepaveFixture(t, kubevirtv1.RunStrategyAlways, harvester.VMIReadiness{Running: true})
-	convergeCredentials(t, ctx, r, inst) // regenerateCloudInit (pass 2) needs stable Material
+	seedDurableCredentials(t, ctx, r, inst) // regenerateCloudInit (pass 2) needs stable Material
 	triggerRepave(inst, "trigger-1")
 
 	// Pass 1: VM running -> stop it.

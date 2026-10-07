@@ -19,11 +19,14 @@ package ensure
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	kubevirtv1 "kubevirt.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
@@ -273,27 +276,313 @@ func TestEnsureCredentialsDoesNotResetSourceChanged(t *testing.T) {
 	}
 }
 
-func TestEnsureCredentialsMissingSourceBlocksProvisioningAndCreatesNothing(t *testing.T) {
+// seedDurableCredentials stores the three durable Secrets the way first-time
+// provisioning does before the VM exists. It bypasses the "established" guard on
+// purpose: tests that start from an already-booted instance (appliedSpec set, VM
+// present) need its Secrets to exist, and a real booted instance always has them.
+func seedDurableCredentials(t *testing.T, ctx context.Context, r *testHarness, inst *dbaasv1.DBInstance) {
+	t.Helper()
+	resolver := r.credentialsResolver()
+	resolver.Established = nil
+	if _, err := resolver.Resolve(ctx, inst); err != nil {
+		t.Fatalf("seed durable credentials: %v", err)
+	}
+}
+
+func secretKeys(inst *dbaasv1.DBInstance) []types.NamespacedName {
+	return []types.NamespacedName{
+		{Namespace: "tenant-a", Name: credentials.TenantCredentialsSecretName(inst)},
+		{Namespace: "dbaas-system", Name: credentials.InternalSecretName(inst)},
+		{Namespace: "dbaas-system", Name: credentials.TLSSecretName(inst)},
+	}
+}
+
+func secretExists(r *testHarness, key types.NamespacedName) bool {
+	var sec corev1.Secret
+	return r.Get(context.Background(), key, &sec) == nil
+}
+
+func assertNoSecretsCreated(t *testing.T, r *testHarness, inst *dbaasv1.DBInstance) {
+	t.Helper()
+	for _, key := range secretKeys(inst) {
+		if secretExists(r, key) {
+			t.Errorf("Secret %s was created", key)
+		}
+	}
+}
+
+// drainEvents returns the Warning/Normal events recorded so far.
+func drainEvents(r *testHarness) []string {
+	rec, ok := r.Recorder.(*record.FakeRecorder)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for {
+		select {
+		case e := <-rec.Events:
+			out = append(out, e)
+		default:
+			return out
+		}
+	}
+}
+
+// --- a missing user-provided password source ---
+
+func TestEnsureCredentialsMissingSourceWaitsAndCreatesNothing(t *testing.T) {
 	ctx := context.Background()
 	inst := byoProvisionInst()
-	r := newTestHarness(t, &stubHarvester{}, inst) // no source Secret
+	r := newTestHarness(t, &stubHarvester{}, inst) // no source Secret yet
 
 	res := r.ensureCredentials(ctx, inst)
 
-	if res.Outcome != OutcomeTransient || !errors.Is(res.Err, credentials.ErrPasswordSourceNotFound) {
-		t.Fatalf("result = %+v, want Transient wrapping ErrPasswordSourceNotFound", res)
+	if res.Outcome != OutcomePending || res.Reason != dbaasv1.ReasonPasswordSourceNotFound ||
+		res.ControllerResult.RequeueAfter != credentialSourceRequeue {
+		t.Fatalf("result = %+v, want Pending/PasswordSourceNotFound after %s", res, credentialSourceRequeue)
 	}
-	if inst.Status.IsConditionTrue(dbaasv1.ConditionCredentialsReady) {
-		t.Fatal("CredentialsReady must not be True without a password")
+	cond := inst.Status.GetCondition(dbaasv1.ConditionCredentialsReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != string(dbaasv1.ReasonPasswordSourceNotFound) {
+		t.Fatalf("CredentialsReady = %+v, want False/PasswordSourceNotFound", cond)
 	}
-	for _, key := range []types.NamespacedName{
-		{Namespace: "tenant-a", Name: "pg-orders-credentials"},
-		{Namespace: "dbaas-system", Name: credentials.InternalSecretName(inst)},
-		{Namespace: "dbaas-system", Name: credentials.TLSSecretName(inst)},
-	} {
-		var sec corev1.Secret
-		if err := r.Get(ctx, key, &sec); err == nil {
-			t.Errorf("Secret %s was created despite the missing source", key)
+	if !strings.Contains(cond.Message, "orders-pw") {
+		t.Errorf("message %q should name the missing Secret", cond.Message)
+	}
+	assertNoSecretsCreated(t, r, inst)
+
+	// The user creates the Secret: the next pass proceeds.
+	created := byoSourceSecret()
+	created.ResourceVersion = "" // the API server assigns it on Create
+	if err := r.Create(ctx, created); err != nil {
+		t.Fatal(err)
+	}
+	convergeCredentials(t, ctx, r, inst)
+	if !inst.Status.IsConditionTrue(dbaasv1.ConditionCredentialsReady) {
+		t.Fatal("CredentialsReady should be True once the source exists")
+	}
+}
+
+func TestEnsureCredentialsInvalidSourceWaitsWithoutLeakingThePassword(t *testing.T) {
+	ctx := context.Background()
+	inst := byoProvisionInst()
+	bad := byoSourceSecret()
+	bad.Type = corev1.SecretTypeOpaque // wrong type
+	bad.Data["password"] = []byte("TOPSECRETMARKER-password")
+	r := newTestHarness(t, &stubHarvester{}, inst, bad)
+
+	res := r.ensureCredentials(ctx, inst)
+
+	if res.Outcome != OutcomePending || res.Reason != dbaasv1.ReasonPasswordSourceInvalid ||
+		res.ControllerResult.RequeueAfter != credentialSourceRequeue {
+		t.Fatalf("result = %+v, want Pending/PasswordSourceInvalid after %s", res, credentialSourceRequeue)
+	}
+	cond := inst.Status.GetCondition(dbaasv1.ConditionCredentialsReady)
+	if cond == nil || cond.Reason != string(dbaasv1.ReasonPasswordSourceInvalid) {
+		t.Fatalf("CredentialsReady = %+v", cond)
+	}
+	if strings.Contains(cond.Message, "TOPSECRETMARKER") || strings.Contains(res.Message, "TOPSECRETMARKER") {
+		t.Fatalf("condition leaks the password: %q", cond.Message)
+	}
+	assertNoSecretsCreated(t, r, inst)
+
+	// The user fixes the type: provisioning continues.
+	fixed := byoSourceSecret()
+	fixed.ResourceVersion = ""
+	fixed.Data["password"] = []byte("TOPSECRETMARKER-password")
+	var live corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: "tenant-a", Name: "orders-pw"}, &live); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(ctx, &live); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Create(ctx, fixed); err != nil {
+		t.Fatal(err)
+	}
+	convergeCredentials(t, ctx, r, inst)
+}
+
+// --- a lost durable Secret on an instance whose VM already exists ---
+
+func TestEnsureCredentialsLostWhenAppliedSpecShowsTheVMWasCreated(t *testing.T) {
+	ctx := context.Background()
+	inst := newProvisionInst()
+	inst.Status.AppliedSpec = &dbaasv1.AppliedSpec{NetworkRef: inst.Spec.NetworkRef}
+	r := newTestHarness(t, &stubHarvester{}, inst) // no Secrets at all
+
+	res := r.ensureCredentials(ctx, inst)
+
+	if res.Outcome != OutcomePending || res.Reason != dbaasv1.ReasonCredentialsLost ||
+		res.ControllerResult.RequeueAfter != credentialSourceRequeue {
+		t.Fatalf("result = %+v, want Pending/CredentialsLost after %s", res, credentialSourceRequeue)
+	}
+	cond := inst.Status.GetCondition(dbaasv1.ConditionCredentialsReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != string(dbaasv1.ReasonCredentialsLost) {
+		t.Fatalf("CredentialsReady = %+v, want False/CredentialsLost", cond)
+	}
+	assertNoSecretsCreated(t, r, inst)
+}
+
+func TestEnsureCredentialsLostWhenTheVMExistsEvenIfStatusWasNotSaved(t *testing.T) {
+	ctx := context.Background()
+	inst := newProvisionInst() // appliedSpec nil: the crash-after-create-before-status gap
+	r := newTestHarness(t, &stubHarvester{}, inst, testVM("pg-orders", "tenant-a"))
+
+	res := r.ensureCredentials(ctx, inst)
+
+	if res.Reason != dbaasv1.ReasonCredentialsLost {
+		t.Fatalf("result = %+v, want CredentialsLost (the live VM proves it was created)", res)
+	}
+	assertNoSecretsCreated(t, r, inst)
+}
+
+// The review's required case: a VM create that failed leaves the cloud-init
+// Secret name and VM name in status, but no VM and no database. Losing the
+// credentials then must NOT be treated as unrecoverable.
+func TestEnsureCredentialsNotLostWhenVMCreationNeverSucceeded(t *testing.T) {
+	ctx := context.Background()
+	inst := newProvisionInst()
+	inst.Status.Resources.CloudInitSecretName = "pg-orders-cloudinit"
+	inst.Status.Resources.VMName = "pg-orders"
+	// no AppliedSpec, no VirtualMachine in the cluster
+	r := newTestHarness(t, &stubHarvester{}, inst)
+
+	res := r.ensureCredentials(ctx, inst)
+
+	if res.Outcome != OutcomePending || res.Reason != dbaasv1.ReasonCredentialsCreated {
+		t.Fatalf("result = %+v, want a normal Pending/CredentialsCreated, not CredentialsLost", res)
+	}
+	if !inst.Status.IsConditionTrue(dbaasv1.ConditionCredentialsReady) {
+		t.Fatal("CredentialsReady should be True")
+	}
+	for _, key := range secretKeys(inst) {
+		if !secretExists(r, key) {
+			t.Errorf("Secret %s was not recreated", key)
 		}
 	}
+}
+
+func TestEnsureCredentialsLostEventIsEmittedOnceNotOnEveryPoll(t *testing.T) {
+	ctx := context.Background()
+	inst := newProvisionInst()
+	inst.Status.AppliedSpec = &dbaasv1.AppliedSpec{NetworkRef: inst.Spec.NetworkRef}
+	r := newTestHarness(t, &stubHarvester{}, inst)
+
+	for i := 0; i < 4; i++ {
+		if res := r.ensureCredentials(ctx, inst); res.Reason != dbaasv1.ReasonCredentialsLost {
+			t.Fatalf("poll %d result = %+v", i, res)
+		}
+	}
+	events := drainEvents(r)
+	if len(events) != 1 || !strings.Contains(events[0], "Warning") || !strings.Contains(events[0], "CredentialsLost") {
+		t.Fatalf("events = %v, want exactly one Warning CredentialsLost", events)
+	}
+}
+
+func TestEnsureCredentialsRecoversOnceTheSecretIsRestored(t *testing.T) {
+	ctx := context.Background()
+	inst := newProvisionInst()
+	r := newTestHarness(t, &stubHarvester{}, inst)
+	convergeCredentials(t, ctx, r, inst)
+
+	key := secretKeys(inst)[0]
+	var original corev1.Secret
+	if err := r.Get(ctx, key, &original); err != nil {
+		t.Fatal(err)
+	}
+	password := string(original.Data["admin_password"])
+	if password == "" {
+		password = original.StringData["admin_password"]
+	}
+
+	// The VM is created, then the credentials Secret is lost.
+	inst.Status.AppliedSpec = &dbaasv1.AppliedSpec{NetworkRef: inst.Spec.NetworkRef}
+	if err := r.Delete(ctx, &original); err != nil {
+		t.Fatal(err)
+	}
+	if res := r.ensureCredentials(ctx, inst); res.Reason != dbaasv1.ReasonCredentialsLost {
+		t.Fatalf("result = %+v, want CredentialsLost", res)
+	}
+	if secretExists(r, key) {
+		t.Fatal("a replacement Secret was generated")
+	}
+
+	// An admin restores it from a backup.
+	restored := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name},
+		StringData: map[string]string{"admin_user": "dbadmin", "admin_password": password},
+	}
+	if err := r.Create(ctx, restored); err != nil {
+		t.Fatal(err)
+	}
+	if res := r.ensureCredentials(ctx, inst); res.Outcome != OutcomeSatisfied {
+		t.Fatalf("after restore result = %+v, want Satisfied", res)
+	}
+	cond := inst.Status.GetCondition(dbaasv1.ConditionCredentialsReady)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != string(dbaasv1.ReasonCredentialsProvisioned) {
+		t.Fatalf("CredentialsReady = %+v, want True/CredentialsProvisioned", cond)
+	}
+}
+
+// The same rule covers the platform-owned Secrets: a regenerated TLS CA or
+// exporter password would not match the running VM either.
+func TestEnsureCredentialsLostCoversInternalAndTLSSecrets(t *testing.T) {
+	for i, what := range []string{"credentials", "internal", "TLS"} {
+		t.Run(what, func(t *testing.T) {
+			ctx := context.Background()
+			inst := newProvisionInst()
+			r := newTestHarness(t, &stubHarvester{}, inst)
+			convergeCredentials(t, ctx, r, inst)
+			inst.Status.AppliedSpec = &dbaasv1.AppliedSpec{NetworkRef: inst.Spec.NetworkRef}
+
+			key := secretKeys(inst)[i]
+			var sec corev1.Secret
+			if err := r.Get(ctx, key, &sec); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.Delete(ctx, &sec); err != nil {
+				t.Fatal(err)
+			}
+
+			res := r.ensureCredentials(ctx, inst)
+			if res.Reason != dbaasv1.ReasonCredentialsLost {
+				t.Fatalf("result = %+v, want CredentialsLost", res)
+			}
+			if !strings.Contains(res.Message, key.Name) {
+				t.Errorf("message %q should name %s", res.Message, key.Name)
+			}
+			if secretExists(r, key) {
+				t.Fatalf("%s was regenerated", key)
+			}
+		})
+	}
+}
+
+// A failure to find out whether the VM exists is a plain transient error: it
+// must not read as "lost" (which would raise an alarm) or "not established"
+// (which would regenerate a password).
+func TestEnsureCredentialsEstablishedLookupFailureIsTransient(t *testing.T) {
+	ctx := context.Background()
+	inst := newProvisionInst()
+	r := newTestHarness(t, &stubHarvester{}, inst)
+	boom := errors.New("apiserver unavailable")
+	watch, ok := r.Client.(client.WithWatch)
+	if !ok {
+		t.Fatal("fake client does not implement client.WithWatch")
+	}
+	r.Client = interceptor.NewClient(watch, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, isVM := obj.(*kubevirtv1.VirtualMachine); isVM {
+				return boom
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+
+	res := r.ensureCredentials(ctx, inst)
+
+	if res.Outcome != OutcomeTransient || !errors.Is(res.Err, boom) {
+		t.Fatalf("result = %+v, want Transient wrapping the lookup error", res)
+	}
+	assertNoSecretsCreated(t, r, inst)
 }

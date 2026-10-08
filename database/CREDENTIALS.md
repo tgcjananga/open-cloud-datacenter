@@ -26,6 +26,18 @@ kubectl get secret pg-<name>-credentials -n <ns> -o jsonpath='{.data.admin_passw
      --from-file=password=./password.txt      # printf, not echo: no trailing newline
    ```
 
+   Or pass the password directly(Only for testings- not secure). Use single quotes so the shell does not expand `$`, backticks or `!`:
+
+   ```sh
+   kubectl create secret generic orders-db-password -n <ns> \
+     --type=dbaas.opencloud.wso2.com/master-password \
+     --from-literal=password='<your-password>'
+   ```
+
+   `--from-literal` stores exactly what you type, so there is no trailing-newline risk.(This command saves your password in plain text in your shell history)
+
+
+
 2. Reference it. A complete example is [`config/samples/dbaas_v1alpha1_dbinstance_byo_password.yaml`](./config/samples/dbaas_v1alpha1_dbinstance_byo_password.yaml):
 
    ```yaml
@@ -40,6 +52,7 @@ kubectl get secret pg-<name>-credentials -n <ns> -o jsonpath='{.data.admin_passw
 **Rules** (a problem shows up on the `CredentialsReady` condition, see below):
 
 - The Secret must have the type above. The type only guards against pointing at the wrong Secret. It is not access control: anyone who can write a Secret can set it. RBAC decides who may reference what.
+- The Secret must be in the **same namespace** as the `DBInstance`. `secretRef` has only `name` and `key`, with no namespace field, so the operator looks in the instance's own namespace. A Secret anywhere else is reported as `PasswordSourceNotFound`, and nothing is created. This also means one tenant cannot reference another tenant's Secret.
 - The password must be valid UTF-8, **8 to 128 bytes**, with no line break. A trailing newline from `echo` is the usual mistake.
 - `masterUsername` may not be `postgres`, `postgres_exporter`, `replicator`, `repl`, `public`, `none` or start with `pg_` (any case).
 - The Secret may not be named `pg-<name>-credentials`, `pg-<name>-connect` or `pg-<name>-cloudinit`. DBaaS creates and deletes Secrets with those names.
@@ -48,7 +61,7 @@ kubectl get secret pg-<name>-credentials -n <ns> -o jsonpath='{.data.admin_passw
 ## What happens after creation
 
 - **Your Secret is a creation-time input.** The operator reads it once and keeps its own copy in `pg-<name>-credentials`. Retries and repaves use that copy.
-- **Editing your Secret later does not change the database password.** The instance reports `status.credentials.sourceChanged: true` and one Warning event, `PasswordSourceChanged`. "Changed" means the Secret object changed (a label edit counts), not necessarily the password.
+- **Editing your Secret later does not change the database password.** The instance reports `status.credentials.sourceChanged: true` and one Warning event, `PasswordSourceChanged`. "Changed" means the Secret object changed (a label edit counts), not necessarily the password. The report appears at the instance's **next reconcile**, not instantly: nothing watches your Secret, so on an idle cluster it can take a long time. Any change to the `DBInstance` triggers one, even an annotation: `kubectl annotate dbinstance <name> -n <ns> nudge=$(date +%s) --overwrite`.
 - **Deleting your Secret later changes nothing** and is not reported. The saved copy is what matters.
 - **A password changed inside PostgreSQL** (`ALTER ROLE`) is invisible to DBaaS. Update `admin_password` in `pg-<name>-credentials` to match, so the record stays true.
 - **A repave keeps the password.** The data disk keeps its roles, so the new VM does not reset them.
@@ -96,7 +109,7 @@ kubectl get dbinstance <name> -n <ns> -o jsonpath='{.status.conditions[?(@.type=
 | --- | --- |
 | Forgot the password; the instance is fine | Read `pg-<name>-credentials` (command above) |
 | Your Secret was edited or deleted | The database is unchanged. The password it uses is in `pg-<name>-credentials` |
-| `CredentialsLost`: `pg-<name>-credentials` is missing | If you know the password: recreate it with keys `admin_user` and `admin_password`; the operator continues on its next poll. Otherwise restore it from a backup |
+| `CredentialsLost`: `pg-<name>-credentials` is missing | If you know the password: recreate it with keys `admin_user` and `admin_password`; the operator continues on its next poll (within about 30 seconds). A Secret recreated by hand has no source annotations, so `status.credentials.source` then reads `Generated`; the database is unaffected. Otherwise restore it from a backup |
 | `CredentialsLost`: `dbi-<uid>-internal` or `-tls` is missing | An admin restores it from a cluster backup. DBaaS will not regenerate it: a new CA or exporter password would not match the running VM. With no backup, recreate the instance and restore the data from a `pg_dump` |
 | No copy of the password exists anywhere | The old password cannot be recovered (PostgreSQL keeps only a hash). It can only be **reset inside PostgreSQL**, which needs a shell on the VM |
 

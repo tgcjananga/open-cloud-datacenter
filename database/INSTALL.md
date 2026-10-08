@@ -17,13 +17,41 @@ Beyond README.md's base prerequisites (Harvester cluster, NAD, `kubectl`):
 
 ## Testing without WSO2 registry access
 
-Until write access to the real `ghcr.io/wso2/...` namespace exists (the one open item in [Discussion #303](https://github.com/wso2/open-cloud-datacenter/discussions/303)'s "Clarifications requested"), every committed default (chart `values.yaml`, the Addon example manifest) stays generic/placeholder. Test against your own personal GHCR via overrides, never by editing those defaults:
+Until write access to `ghcr.io/wso2/...` exists (the open item in [Discussion #303](https://github.com/wso2/open-cloud-datacenter/discussions/303)'s "Clarifications requested"), every committed default (chart `values.yaml`, the Addon example manifest) stays placeholder. Test against your own GHCR through overrides, never by editing those defaults.
 
-- **Chart:** `helm upgrade --install dbaas-operator database/charts/chart --set manager.image.repository=ghcr.io/<you>/dbaas-operator --set manager.image.tag=<tag>`
-- **Kustomize (`make deploy`):** `make deploy IMG=ghcr.io/<you>/dbaas-controller:<tag>` — mutates `config/manager/kustomization.yaml`; revert after: `git checkout -- config/manager/kustomization.yaml`.
-- **Addon manifest:** copy `deploy/harvester-addon/dbaas-operator/dbaas-operator.yaml` to `dbaas-operator.local.yaml` (gitignored) and fill in your own values there. Never edit the committed one.
+| Path | Override |
+| --- | --- |
+| Chart | `helm upgrade --install dbaas-operator database/charts/chart --set manager.image.repository=ghcr.io/<you>/dbaas-operator --set manager.image.tag=<tag>` |
+| Kustomize | `make deploy IMG=ghcr.io/<you>/dbaas-controller:<tag>`, then revert with `git checkout -- config/manager/kustomization.yaml` |
+| Addon | Copy `deploy/harvester-addon/dbaas-operator/dbaas-operator.yaml` to the gitignored `dbaas-operator.local.yaml` and edit the copy |
 
-If a review needs your personal artifacts as evidence before real registry access exists, cite digests/commit — as Discussion #303's "What's already proven" does — rather than committing the personal reference.
+### Using your own image on an installed Addon
+
+The Addon owns the Helm release, so set the image and manager args through its `valuesContent`. Don't run `helm upgrade` on that release: the Addon can overwrite it.
+
+The Addon's `chart:` path only fetches the chart. The manager image is a separate package, and with `valuesContent: {}` it defaults to `ghcr.io/wso2/dbaas-operator:<appVersion>`. Until that namespace exists the pod ends in `ImagePullBackOff`.
+
+Run `kubectl -n dbaas-system edit addon dbaas-operator` (or apply the same block from your `.local.yaml`) and replace `valuesContent`:
+
+```yaml
+spec:
+  valuesContent: |-
+    manager:
+      image:
+        repository: ghcr.io/<you>/dbaas-operator
+        tag: "<tag>"
+      args:                                          # optional
+        - --operator.leaderElection.enabled=true     # keep the defaults...
+        - --observability.metrics.bindAddress=:8443
+        - --security.rejectVMPassword=true           # ...then add your flags
+```
+
+- **Args replace, they don't merge.** Repeat both defaults from the chart's `values.yaml`, or omit `args` to keep them. Without them leader election and metrics are silently lost.
+- **Config is read at startup,** so the manager pod restarts on each change: `kubectl -n dbaas-system get pods -w`.
+- **Still `ImagePullBackOff`?** `kubectl -n dbaas-system describe pod <manager-pod>` and read the Events. `not found` means the tag was never pushed. `unauthorized` means the package is private: make it public (step 6) or add a `dockerRegistrySecret` to the Addon.
+- **Revert** by setting `valuesContent` to `{}`. Keep these overrides in the live Addon or the `.local.yaml` only, never the committed manifest.
+
+If a review needs your personal artifacts as evidence, cite digests and commits, as Discussion #303's "What's already proven" does, rather than committing the personal reference.
 
 ---
 

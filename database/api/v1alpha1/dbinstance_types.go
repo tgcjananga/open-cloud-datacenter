@@ -120,8 +120,6 @@ type DBInstanceSpec struct {
 	// password. Editing or deleting the source Secret afterwards does not
 	// change the database.
 	// Immutable after creation.
-	// NOT YET APPLIED: the API accepts this field but the controller does not
-	// read it until the password-source resolution lands.
 	// +optional
 	Credentials *CredentialsSpec `json:"credentials,omitempty"`
 

@@ -17,8 +17,9 @@ This is a preview. The API is `v1alpha1`, there is no tested upgrade path betwee
 
 | Component | Version |
 | --- | --- |
-| Harvester | 1.7.1 (tested) |
-| RKE2 | v1.34.3 (tested) |
+| Harvester | 1.9.0 (tested) |
+| RKE2 | v1.36.3+rke2r1 (tested) |
+| Rancher (for the UI extension) | 2.15.2 (tested); 2.15 or later required |
 | KubeVirt API and client | v1.6.0 (built against) |
 | controller-runtime | v0.20.4 (built against) |
 | Kubernetes client libraries | v0.32.5 (built against) |
@@ -27,7 +28,7 @@ This is a preview. The API is `v1alpha1`, there is no tested upgrade path betwee
 | PostgreSQL | 15, 16, 17 on Ubuntu 22.04; 15, 16, 17, 18 on Ubuntu 24.04 |
 | Storage | Longhorn (default StorageClass `longhorn`) |
 
-Only Harvester 1.7.1 has been exercised. Other versions are untested and unsupported. The Harvester `Addon` route was validated on the maintainer's cluster, not on a range of versions.
+Only Harvester 1.9.0 has been exercised. Other versions are untested and unsupported. The Harvester `Addon` route was validated on the maintainer's cluster, not on a range of versions.
 
 ### Highlights
 

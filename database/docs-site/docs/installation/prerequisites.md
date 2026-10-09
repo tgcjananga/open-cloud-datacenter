@@ -11,7 +11,7 @@ The operator runs inside a Harvester HCI cluster and drives KubeVirt, CDI and Ha
 
 | Requirement | Detail |
 | --- | --- |
-| Harvester HCI | The README states it was tested on Harvester 1.7.1 (RKE2 v1.34.3). No version check exists in the operator code, so other versions are untested rather than blocked. |
+| Harvester HCI | Tested on Harvester 1.9.0 (RKE2 v1.36.3+rke2r1). No version check exists in the operator code, so other versions are untested rather than blocked. |
 | Multus `NetworkAttachmentDefinition` | A NAD for the VM data network must already exist. A `DBInstance` references it through `spec.networkRef` (`namespace/name`). The operator never creates networks. |
 | Rancher Monitoring | Provides the Prometheus Operator and the `ServiceMonitor` CRD. The operator creates a `ServiceMonitor` per instance and holds RBAC for `monitoring.coreos.com/servicemonitors`, so the CRD must exist. |
 | Baked VM image | A `VirtualMachineImage` matching the catalog name must exist and be ready (see below). |

@@ -30,7 +30,7 @@ Versions come from the baked-image catalog compiled into the operator.
 
 ### Which Harvester version is supported?
 
-The repository documents testing on Harvester 1.7.1 on RKE2 v1.34.3. It is compiled against KubeVirt API v1.6.0 and controller-runtime v0.20.4. No other Harvester version has been certified.
+The operator has been tested on Harvester 1.9.0 on RKE2 v1.36.3+rke2r1. It is compiled against KubeVirt API v1.6.0 and controller-runtime v0.20.4. No other Harvester version has been certified.
 
 ## Installation
 

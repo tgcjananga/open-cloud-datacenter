@@ -72,7 +72,7 @@ available yet:
 
 | Requirement | Details |
 | --- | --- |
-| Harvester HCI | Tested on Harvester 1.7.1 (RKE2 v1.34.3). KubeVirt, CDI and Harvester's `VirtualMachineImage` API must be present. |
+| Harvester HCI | Tested on Harvester 1.9.0 (RKE2 v1.36.3+rke2r1). KubeVirt, CDI and Harvester's `VirtualMachineImage` API must be present. |
 | Network | A Multus `NetworkAttachmentDefinition` already exists; `spec.networkRef` is `namespace/name` of it. Preflight requires the field to be set but does not yet verify that the NAD exists. |
 | Baked OS image | The catalog compiled into the operator names the images it will use (default OS stream `22.04` resolves to `ubuntu-2204-postgres-v20260515`). That image must be imported into Harvester and ready, in the configured image namespace (default `default`). See [Images and repave](/operations/images-and-repave). |
 | Storage class | `longhorn` unless `databaseDefaults.storageClass` or `spec.storageType` says otherwise. |

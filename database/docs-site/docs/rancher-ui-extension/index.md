@@ -7,7 +7,7 @@ sidebar_position: 1
 
 The DBaaS extension lets you manage databases from the Rancher UI, with no `kubectl` or YAML. It works on the same `DBInstance`, `DBSnapshot` and `DBRestore` resources described elsewhere in these docs.
 
-**You need:** Rancher 2.15 or later, and a Harvester cluster with the DBaaS operator installed. Clusters without the operator don't appear in the list.
+**You need:** Rancher 2.15 or later (tested with 2.15.2), and a Harvester cluster with the DBaaS operator installed. Clusters without the operator don't appear in the list.
 
 ## Find your way around
 
